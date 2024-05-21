@@ -62,9 +62,39 @@
 #include "mfem.hpp"
 #include <fstream>
 #include <iostream>
+#include <chrono>
 
 using namespace std;
 using namespace mfem;
+
+class Timer{
+
+   public:
+
+   void start(){
+      begin = chrono::high_resolution_clock::now();
+   }
+
+   void end(){
+      finish = chrono::high_resolution_clock::now();
+      time = chrono::duration_cast<chrono::microseconds>(finish-begin);
+   }
+
+   chrono::microseconds gettime(){
+      return time;
+   }
+
+   friend ostream& operator<<(ostream& os, Timer& timer){
+      os << timer.gettime().count();
+      return os;
+   }
+
+
+   private:
+
+   chrono::_V2::system_clock::time_point begin, finish;
+   chrono::microseconds time{0};
+};
 
 int main(int argc, char *argv[])
 {
@@ -83,6 +113,12 @@ int main(int argc, char *argv[])
    const char *device_config = "cpu";
    bool visualization = true;
    bool algebraic_ceed = false;
+   int par_ref_levels = 2;
+   int ref_levels = 2;
+
+   // List of timers we'll be using
+   Timer p_ref_time, fes_time, formsys_time, prec_time, pcg_time;
+
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -90,6 +126,10 @@ int main(int argc, char *argv[])
    args.AddOption(&order, "-o", "--order",
                   "Finite element order (polynomial degree) or -1 for"
                   " isoparametric space.");
+   args.AddOption(&par_ref_levels, "-pr", "--parallel-refinement",
+                  "Parallel refinement level");
+   args.AddOption(&ref_levels, "-sr", "--serial-refinement",
+                  "Serial refinement level");
    args.AddOption(&static_cond, "-sc", "--static-condensation", "-no-sc",
                   "--no-static-condensation", "Enable static condensation.");
    args.AddOption(&pa, "-pa", "--partial-assembly", "-no-pa",
@@ -132,16 +172,10 @@ int main(int argc, char *argv[])
    int dim = mesh.Dimension();
 
    // 5. Refine the serial mesh on all processors to increase the resolution. In
-   //    this example we do 'ref_levels' of uniform refinement. We choose
-   //    'ref_levels' to be the largest number that gives a final mesh with no
-   //    more than 10,000 elements.
+   //    this example we do 'ref_levels' of uniform refinement.
+   for (int l = 0; l < ref_levels; l++)
    {
-      int ref_levels =
-         (int)floor(log(10000./mesh.GetNE())/log(2.)/dim);
-      for (int l = 0; l < ref_levels; l++)
-      {
-         mesh.UniformRefinement();
-      }
+      mesh.UniformRefinement();
    }
 
    // 6. Define a parallel mesh by a partitioning of the serial mesh. Refine
@@ -149,19 +183,20 @@ int main(int argc, char *argv[])
    //    parallel mesh is defined, the serial mesh can be deleted.
    ParMesh pmesh(MPI_COMM_WORLD, mesh);
    mesh.Clear();
+   p_ref_time.start();
+   for (int l = 0; l < par_ref_levels; l++)
    {
-      int par_ref_levels = 2;
-      for (int l = 0; l < par_ref_levels; l++)
-      {
-         pmesh.UniformRefinement();
-      }
+      pmesh.UniformRefinement();
    }
+   p_ref_time.end();
+   
 
    // 7. Define a parallel finite element space on the parallel mesh. Here we
    //    use continuous Lagrange finite elements of the specified order. If
    //    order < 1, we instead use an isoparametric/isogeometric space.
    FiniteElementCollection *fec;
    bool delete_fec;
+   fes_time.start();
    if (order > 0)
    {
       fec = new H1_FECollection(order, dim);
@@ -182,6 +217,7 @@ int main(int argc, char *argv[])
       delete_fec = true;
    }
    ParFiniteElementSpace fespace(&pmesh, fec);
+   fes_time.end();
    HYPRE_BigInt size = fespace.GlobalTrueVSize();
    if (myid == 0)
    {
@@ -238,12 +274,15 @@ int main(int argc, char *argv[])
 
    OperatorPtr A;
    Vector B, X;
+   formsys_time.start();
    a.FormLinearSystem(ess_tdof_list, x, b, A, X, B);
+   formsys_time.end();
 
    // 13. Solve the linear system A X = B.
    //     * With full assembly, use the BoomerAMG preconditioner from hypre.
    //     * With partial assembly, use Jacobi smoothing, for now.
    Solver *prec = NULL;
+   prec_time.start();
    if (pa)
    {
       if (UsesTensorBasis(fespace))
@@ -267,40 +306,27 @@ int main(int argc, char *argv[])
    cg.SetMaxIter(2000);
    cg.SetPrintLevel(1);
    if (prec) { cg.SetPreconditioner(*prec); }
+   prec_time.end();
    cg.SetOperator(*A);
+   pcg_time.start();
    cg.Mult(B, X);
+   pcg_time.end();
    delete prec;
+
+   if (myid == 0){
+      cout << endl;
+      cout << "================ RESULTS =======================" << endl;
+      cout << "Times measured in μs" << endl;
+      cout << "DOFs\tRef.\tFES\tFLS\tPrec\tPCG" << endl;
+      cout << size << "\t" << p_ref_time << "\t" << fes_time << "\t" \
+           << formsys_time << "\t" << prec_time << "\t" << pcg_time << endl;
+      cout << "================================================" << endl;
+   }
+
 
    // 14. Recover the parallel grid function corresponding to X. This is the
    //     local finite element solution on each processor.
    a.RecoverFEMSolution(X, b, x);
-
-   // 15. Save the refined mesh and the solution in parallel. This output can
-   //     be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
-   {
-      ostringstream mesh_name, sol_name;
-      mesh_name << "mesh." << setfill('0') << setw(6) << myid;
-      sol_name << "sol." << setfill('0') << setw(6) << myid;
-
-      ofstream mesh_ofs(mesh_name.str().c_str());
-      mesh_ofs.precision(8);
-      pmesh.Print(mesh_ofs);
-
-      ofstream sol_ofs(sol_name.str().c_str());
-      sol_ofs.precision(8);
-      x.Save(sol_ofs);
-   }
-
-   // 16. Send the solution by socket to a GLVis server.
-   if (visualization)
-   {
-      char vishost[] = "localhost";
-      int  visport   = 19916;
-      socketstream sol_sock(vishost, visport);
-      sol_sock << "parallel " << num_procs << " " << myid << "\n";
-      sol_sock.precision(8);
-      sol_sock << "solution\n" << pmesh << x << flush;
-   }
 
    // 17. Free the used memory.
    if (delete_fec)
