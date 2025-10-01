@@ -1,100 +1,4 @@
-#include "mfem.hpp"
-#include <fstream>
-#include <iostream>
-
-using namespace mfem;
-
-class Ricci2D
-{
-
-public:
-
-    Ricci2D(int order = 1, int ref_levels = 0, real_t xL = 1.2, real_t yL = 1.2, real_t max_t = 120, int nstep = 100);
-    ~Ricci2D() = default;
-
-    void Save();
-    void updateVd();
-    void updatePhi();
-    void formMKB();
-    void updateDataCollection(int step);
-    DivergenceGridFunctionCoefficient * div(VectorCoefficient &vc);
-    
-    // Simulation parameters
-    real_t _max_t;
-    real_t _dt;
-    int _nstep;
-    int _order;
-    int _ref_levels;
-    int _dim = 2;
-
-    // Physical parameters
-    ConstantCoefficient _Binv; // Factor in front of Poisson brackets
-    real_t _Lambda; // Factor in the exponential term
-    real_t _kh3; // Factor in front of the third term containing the thermal exponential
-
-    // Matrices
-    std::unique_ptr<ParBilinearForm> _m;
-    std::unique_ptr<ParBilinearForm> _k;
-    std::unique_ptr<ParLinearForm> _b;
-
-    // Variables
-    std::unique_ptr<ParGridFunction> _omega;
-    std::unique_ptr<ParGridFunction> _phi;
-    std::unique_ptr<ParGridFunction> _T;
-
-private:
-
-    void buildMesh(real_t xL, real_t yL);
-    void buildGridFunctions();
-    void setInitialConditions();
-    void setOutput();
-    void updateThermalExponential();
-    
-    // Mesh and FES
-    std::unique_ptr<ParMesh> _pmesh;
-    std::unique_ptr<ParFiniteElementSpace> _h1_fes;
-    std::unique_ptr<ParFiniteElementSpace> _hdiv_fes;
-
-    // Auxiliary variables and coefficients
-    DenseMatrix _rotmat;
-    ConstantCoefficient _one{1.0};
-
-    std::unique_ptr<ParGridFunction> _hdiv_gf;
-    std::unique_ptr<GradientGridFunctionCoefficient> _grad_phi;
-    std::unique_ptr<MatrixConstantCoefficient> _grad_rotate;
-    std::unique_ptr<MatrixVectorProductCoefficient> _vd;
-    
-    std::unique_ptr<GridFunctionCoefficient> _phi_gfcoef;
-    std::unique_ptr<GridFunctionCoefficient> _T_gfcoef;
-
-    std::unique_ptr<TransformedCoefficient> _thermal_exp;
-    std::unique_ptr<SumCoefficient> _KH3_coef;
-
-    // Data collection
-    std::unique_ptr<ParaViewDataCollection> _visit_dc;
-};
-class FE_Evolution : public TimeDependentOperator
-{
-
-public:
-
-   FE_Evolution(ParBilinearForm &M, ParBilinearForm &K, Vector * b);
-   ~FE_Evolution() override;
-
-   void updateMKB(ParBilinearForm &M, ParBilinearForm &K, Vector * b);
-   void Mult(const Vector &x, Vector &y) const override;
-   
-
-private:
-
-   OperatorHandle _M, _K;
-   Vector * _b;
-   mutable Vector _z;
-   Solver *_M_prec;
-   CGSolver _M_solver;
-   
-};
-
+#include "ex41p.hpp"
 
 int main(int argc, char *argv[])
 {
@@ -104,6 +8,7 @@ int main(int argc, char *argv[])
     Hypre::Init();
     Device device("cpu");
     if (myid == 0) { device.Print(); }
+
 
     // Simulation parameters
     int order = 1;
@@ -121,7 +26,7 @@ int main(int argc, char *argv[])
     ricci.Save();
 
     // Create the time evolution operator
-    FE_Evolution t_op(*ricci._m, *ricci._k, ricci._b.get());
+    FE_Evolution t_op(*ricci._M, *ricci._K, ricci._B.get(), ricci._block_offsets, ricci._pmesh->GetComm());
 
     // Set up the ODE solver
     std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(1);
@@ -137,10 +42,12 @@ int main(int argc, char *argv[])
         {
             ricci.updatePhi();
             ricci.formMKB();
-            t_op.updateMKB(*ricci._m, *ricci._k, ricci._b.get());
+            t_op.updateMKB(*ricci._M, *ricci._K, ricci._B.get());
         }
 
         ode_solver->Step(*ricci._omega, t, ricci._dt);
+        std::cout << "Omega Norml2 = " << ricci._omega->Norml2() << std::endl;
+        std::cout << "Phi Norml2 = " << ricci._phi->Norml2() << std::endl;
 
         ricci.updateDataCollection(s+1);
         ricci.Save();
@@ -149,6 +56,7 @@ int main(int argc, char *argv[])
 
     return 0;
 }
+
 
 
 // Ricci2D methods
@@ -244,21 +152,52 @@ DivergenceGridFunctionCoefficient * Ricci2D::div(VectorCoefficient &vc)
 
 void Ricci2D::formMKB()
 {
-    _m.reset(new ParBilinearForm(_h1_fes.get()));
-    _k.reset(new ParBilinearForm(_h1_fes.get()));
-    _b.reset(new ParLinearForm(_h1_fes.get()));
+    // Make system blocks
+    _block_offsets.SetSize(2); // number of variables + 1
+    _block_offsets[0] = 0;
+    _block_offsets[1] = _h1_fes->GetVSize();
+    //_block_offsets[2] = _h1_fes->GetVSize();
+    _block_offsets.PartialSum();
 
-    _b->AddDomainIntegrator(new DomainLFIntegrator(*_KH3_coef));
-    _b->Assemble();
+    _M.reset(new BlockOperator(_block_offsets));
+    _K.reset(new BlockOperator(_block_offsets));
+    _B.reset(new BlockVector(_block_offsets));
 
-    _m->AddDomainIntegrator(new MassIntegrator);
-    _m->Assemble();
-    _m->Finalize();
+    _M->owns_blocks = true;
+    _K->owns_blocks = true;
 
-    _k->AddDomainIntegrator(new ConvectionIntegrator(*_vd, _Binv.constant));
-    _k->AddDomainIntegrator(new MassIntegrator(*div(*_vd)));
-    _k->Assemble();
-    _k->Finalize();
+    // Omega terms
+
+    ParBilinearForm * m_00 = new ParBilinearForm(_h1_fes.get());
+    ParBilinearForm * k_00 = new ParBilinearForm(_h1_fes.get());
+    ParLinearForm * b_0 = new ParLinearForm(_h1_fes.get());
+
+    m_00->AddDomainIntegrator(new MassIntegrator);
+    m_00->Assemble();
+    m_00->Finalize();
+
+    k_00->AddDomainIntegrator(new ConvectionIntegrator(*_vd, _Binv.constant));
+    k_00->AddDomainIntegrator(new MassIntegrator(*div(*_vd)));
+    k_00->Assemble();
+    k_00->Finalize();
+
+    b_0->AddDomainIntegrator(new DomainLFIntegrator(*_KH3_coef));
+    b_0->Assemble();
+
+    _M->SetBlock(0, 0, m_00);
+    _K->SetBlock(0, 0, k_00);
+    _B->GetBlock(0) = *b_0;
+
+    // T terms
+
+
+    // ...
+
+
+    // n terms
+
+    // ...
+
 }
 
 void Ricci2D::buildMesh(real_t xL, real_t yL)
@@ -280,8 +219,14 @@ void Ricci2D::buildGridFunctions()
     _omega = std::make_unique<ParGridFunction>(_h1_fes.get());
     _T = std::make_unique<ParGridFunction>(_h1_fes.get());
 
+    _dt_omega = std::make_unique<ParGridFunction>(_h1_fes.get());
+    _dt_T = std::make_unique<ParGridFunction>(_h1_fes.get());
+
     // Intermediate gf for computing the divergence of v_d
     _hdiv_gf = std::make_unique<ParGridFunction>(_hdiv_fes.get());
+
+    // List is empty for pure Neumann BCs
+    _ess_tdof_lists.resize(2);
 }
 
 void Ricci2D::setInitialConditions()
@@ -308,50 +253,29 @@ void Ricci2D::updateDataCollection(int step){
 
 // FE_Evolution methods
 
-FE_Evolution::FE_Evolution(ParBilinearForm &M, ParBilinearForm &K, Vector * b)
-   : TimeDependentOperator(M.ParFESpace()->GetTrueVSize()), _b(b),
-     _M_solver(M.ParFESpace()->GetComm()),
-     _z(height)
+FE_Evolution::FE_Evolution(BlockOperator &M, BlockOperator &K, BlockVector * b, Array<int> block_offsets, MPI_Comm comm)
+   : TimeDependentOperator(M.Height(), M.Width()), 
+    _z(block_offsets),
+    _block_offsets(block_offsets),
+    _M_solver(comm)
 {
     updateMKB(M, K, b);
 }
 
-void FE_Evolution::updateMKB(ParBilinearForm &M, ParBilinearForm &K, Vector * b)
+void FE_Evolution::updateMKB(BlockOperator &M, BlockOperator &K, BlockVector * b)
 {
-    if (M.GetAssemblyLevel() == AssemblyLevel::LEGACY)
-    {
-       _M.Reset(M.ParallelAssemble(), true);
-       _K.Reset(K.ParallelAssemble(), true);
-    }
-    else
-    {
-       _M.Reset(&M, false);
-       _K.Reset(&K, false);
-    }
-
+    _M = &M;
+    _K = &K;
+    _b = b;
     _M_solver.SetOperator(*_M);
 
-    Array<int> ess_tdof_list;
-    if (M.GetAssemblyLevel() == AssemblyLevel::LEGACY)
-    {
-       HypreParMatrix &M_mat = *_M.As<HypreParMatrix>();
-       HypreParMatrix &K_mat = *_K.As<HypreParMatrix>();
-       HypreSmoother *hypre_prec = new HypreSmoother(M_mat, HypreSmoother::Jacobi);
-       _M_prec = hypre_prec;
-    }
-    else
-    {
-       _M_prec = new OperatorJacobiSmoother(M, ess_tdof_list);
-    }
+    _M_prec = new BlockDiagonalPreconditioner(_block_offsets);
 
     _M_solver.SetPreconditioner(*_M_prec);
     _M_solver.SetRelTol(1e-9);
     _M_solver.SetAbsTol(0.0);
     _M_solver.SetMaxIter(100);
     _M_solver.SetPrintLevel(0);
-
-    _b = b;
-
 
 }
 
