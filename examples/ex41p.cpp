@@ -20,7 +20,6 @@ int main(int argc, char *argv[])
     
     // Create the Ricci2D problem and obtain initial values
     Ricci2D ricci(order, ref_levels, xL, yL, max_t, nstep);
-    ricci.updatePhi();
     ricci.formMKB();
     ricci.updateDataCollection(0);
     ricci.Save();
@@ -40,14 +39,16 @@ int main(int argc, char *argv[])
 
         if (s!=0)
         {
-            ricci.updatePhi();
             ricci.formMKB();
             t_op.updateMKB(*ricci._M, *ricci._K, ricci._B.get());
         }
 
-        ode_solver->Step(*ricci._omega, t, ricci._dt);
+        ode_solver->Step(*ricci._var_blocks, t, ricci._dt);
+        ricci.updateVars();
         std::cout << "Omega Norml2 = " << ricci._omega->Norml2() << std::endl;
-        std::cout << "Phi Norml2 = " << ricci._phi->Norml2() << std::endl;
+        std::cout << "T Norml2 = "     << ricci._T->Norml2() << std::endl;
+        std::cout << "n Norml2 = "     << ricci._n->Norml2() << std::endl;
+        std::cout << "Phi Norml2 = "   << ricci._phi->Norml2() << std::endl;
 
         ricci.updateDataCollection(s+1);
         ricci.Save();
@@ -66,15 +67,18 @@ Ricci2D::Ricci2D(int order, int ref_levels, real_t xL, real_t yL, real_t max_t, 
             _nstep(nstep),
             _order(order),
             _ref_levels(ref_levels),
+            _xL(xL),
+            _yL(yL),
             _Binv(40.0),
             _Lambda(3.0),
-            _kh3(1.0/24.0),
+            _kh0(1.0/24.0),
             _rotmat({{0, -1},{1, 0}}),
             _grad_rotate{std::make_unique<MatrixConstantCoefficient>(_rotmat)}
 {
     _dt = _max_t / _nstep;
     buildMesh(xL, yL);
     buildGridFunctions();
+    makeRadialCoefficient();
     setInitialConditions();
     setOutput();
 
@@ -82,6 +86,33 @@ Ricci2D::Ricci2D(int order, int ref_levels, real_t xL, real_t yL, real_t max_t, 
     if (Mpi::WorldRank() == 0)
         std::cout << "Number of finite element unknowns: " << size << std::endl;
 }
+
+void Ricci2D::makeRadialCoefficient()
+{
+    // Make a radial coefficient whose origin is at the centre of the mesh
+    _r.reset(new TransformedCoefficient(
+        new CartesianXCoefficient,
+        new CartesianYCoefficient,
+        [this](real_t x, real_t y){ return sqrt(pow((x-_xL/2),2)+pow((y-_yL/2),2));}
+    ));
+}
+
+void Ricci2D::makeSn()
+{
+    // Source term S_n, which in the normalised equations is equal to S_T
+
+    real_t r_unit = 0.5;
+
+    _Sn.reset(new TransformedCoefficient(
+        _r.get(),
+        [r_unit](real_t r)
+        { 
+            real_t r_norm = r/r_unit; 
+            return 0.03*(1-tanh( (r_norm-20)/0.5 )); 
+        }
+    ));
+}
+
 
 void Ricci2D::Save()
 {
@@ -125,9 +156,6 @@ void Ricci2D::updatePhi()
     cg.SetOperator(*_A);
     cg.Mult(B, X);
     a.RecoverFEMSolution(X, b, *_phi);
-
-    updateVd();
-    updateThermalExponential();
 }
 
 void Ricci2D::updateThermalExponential()
@@ -141,22 +169,50 @@ void Ricci2D::updateThermalExponential()
     [this](real_t phi, real_t T) { return exp(_Lambda - phi / T); }
     ));
 
-    _KH3_coef.reset(new SumCoefficient(_one, *_thermal_exp, -_kh3, _kh3));
 }
 
-DivergenceGridFunctionCoefficient * Ricci2D::div(VectorCoefficient &vc)
+void Ricci2D::updateLFCoefs()
+{
+    _KH0_coef.reset(new SumCoefficient(_one, *_thermal_exp, -_kh0, _kh0)); // Check potential sign issues!
+    _omega_LF_coef.reset(new SumCoefficient(*poissonBracket(*_omega), *_KH0_coef, _Binv.constant, 1.0));
+
+    _KH1_coef.reset(new SumCoefficient(*_thermal_exp, _one, 1.71, -0.71));
+    _T_LF_coef.reset(new SumCoefficient(*poissonBracket(*_T), *_KH1_coef, _Binv.constant, -1.0));
+}
+
+void Ricci2D::updateVars(){
+
+    *_omega = _var_blocks->GetBlock(0);
+    *_T = _var_blocks->GetBlock(1);
+    *_n = _var_blocks->GetBlock(2);
+}
+
+Coefficient * Ricci2D::div(VectorCoefficient &vc)
 {
     _hdiv_gf->ProjectCoefficient(vc);
     return new DivergenceGridFunctionCoefficient(_hdiv_gf.get());
 }
 
+Coefficient * Ricci2D::poissonBracket(GridFunction &gf)
+{
+    GridFunctionCoefficient _gfcoef(&gf);
+    ScalarVectorProductCoefficient gf_vd(_gfcoef, *_vd);
+    return div(gf_vd);
+}
+
 void Ricci2D::formMKB()
 {
+    updatePhi();
+    updateVd();
+    updateThermalExponential();
+    updateLFCoefs();
+
     // Make system blocks
-    _block_offsets.SetSize(2); // number of variables + 1
+    _block_offsets.SetSize(4); // number of variables + 1
     _block_offsets[0] = 0;
     _block_offsets[1] = _h1_fes->GetVSize();
-    //_block_offsets[2] = _h1_fes->GetVSize();
+    _block_offsets[2] = _h1_fes->GetVSize();
+    _block_offsets[3] = _h1_fes->GetVSize();
     _block_offsets.PartialSum();
 
     _M.reset(new BlockOperator(_block_offsets));
@@ -165,6 +221,11 @@ void Ricci2D::formMKB()
 
     _M->owns_blocks = true;
     _K->owns_blocks = true;
+
+    _var_blocks.reset(new BlockVector(_block_offsets));
+    _var_blocks->GetBlock(0) = *_omega;
+    _var_blocks->GetBlock(1) = *_T;
+    _var_blocks->GetBlock(2) = *_n;
 
     // Omega terms
 
@@ -176,12 +237,10 @@ void Ricci2D::formMKB()
     m_00->Assemble();
     m_00->Finalize();
 
-    k_00->AddDomainIntegrator(new ConvectionIntegrator(*_vd, _Binv.constant));
-    k_00->AddDomainIntegrator(new MassIntegrator(*div(*_vd)));
     k_00->Assemble();
     k_00->Finalize();
 
-    b_0->AddDomainIntegrator(new DomainLFIntegrator(*_KH3_coef));
+    b_0->AddDomainIntegrator(new DomainLFIntegrator(*_omega_LF_coef));
     b_0->Assemble();
 
     _M->SetBlock(0, 0, m_00);
@@ -190,13 +249,46 @@ void Ricci2D::formMKB()
 
     // T terms
 
+    ParBilinearForm * m_11 = new ParBilinearForm(_h1_fes.get());
+    ParBilinearForm * k_11 = new ParBilinearForm(_h1_fes.get());
+    ParLinearForm * b_1 = new ParLinearForm(_h1_fes.get());
 
-    // ...
+    m_11->AddDomainIntegrator(new MassIntegrator);
+    m_11->Assemble();
+    m_11->Finalize();
 
+    k_11->Assemble();
+    k_11->Finalize();
+
+    _T_LF_coef.reset(new ConstantCoefficient(1.0));
+    b_1->AddDomainIntegrator(new DomainLFIntegrator(*_T_LF_coef));
+    b_1->Assemble();
+
+    _M->SetBlock(1, 1, m_11);
+    _K->SetBlock(1, 1, k_11);
+    _B->GetBlock(1) = *b_1;
 
     // n terms
 
-    // ...
+    ParBilinearForm * m_22 = new ParBilinearForm(_h1_fes.get());
+    ParBilinearForm * k_22 = new ParBilinearForm(_h1_fes.get());
+    ParLinearForm * b_2 = new ParLinearForm(_h1_fes.get());
+
+    m_22->AddDomainIntegrator(new MassIntegrator);
+    m_22->Assemble();
+    m_22->Finalize();
+
+    k_22->Assemble();
+    k_22->Finalize();
+
+    _n_LF_coef.reset(new ConstantCoefficient(1.0));
+    b_2->AddDomainIntegrator(new DomainLFIntegrator(*_n_LF_coef));
+    b_2->Assemble();
+
+    _M->SetBlock(2, 2, m_22);
+    _K->SetBlock(2, 2, k_22);
+    _B->GetBlock(2) = *b_2;
+
 
 }
 
@@ -218,9 +310,7 @@ void Ricci2D::buildGridFunctions()
     _phi = std::make_unique<ParGridFunction>(_h1_fes.get());
     _omega = std::make_unique<ParGridFunction>(_h1_fes.get());
     _T = std::make_unique<ParGridFunction>(_h1_fes.get());
-
-    _dt_omega = std::make_unique<ParGridFunction>(_h1_fes.get());
-    _dt_T = std::make_unique<ParGridFunction>(_h1_fes.get());
+    _n = std::make_unique<ParGridFunction>(_h1_fes.get());
 
     // Intermediate gf for computing the divergence of v_d
     _hdiv_gf = std::make_unique<ParGridFunction>(_hdiv_fes.get());
@@ -234,6 +324,8 @@ void Ricci2D::setInitialConditions()
     *_phi = 0.03;
     *_omega = 0.0;
     *_T = 1.0e-4;
+    *_n = 1.0e-4;
+
 }
 
 void Ricci2D::setOutput()
@@ -242,6 +334,7 @@ void Ricci2D::setOutput()
     _visit_dc->RegisterField("phi", _phi.get());
     _visit_dc->RegisterField("omega", _omega.get());
     _visit_dc->RegisterField("T", _T.get());
+    _visit_dc->RegisterField("n", _n.get());
 }
 
 void Ricci2D::updateDataCollection(int step){
@@ -285,7 +378,6 @@ void FE_Evolution::Mult(const Vector &x, Vector &y) const
     _K->Mult(x, _z);
     _z += *_b;
     _M_solver.Mult(_z, y);
-    std::cout << "domega/dt norml2 = " << y.Norml2() << std::endl;
 }
 
 FE_Evolution::~FE_Evolution()

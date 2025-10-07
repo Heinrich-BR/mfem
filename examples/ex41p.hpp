@@ -13,15 +13,17 @@ public:
     ~Ricci2D() = default;
 
     void Save();
-    void updateVd();
-    void updatePhi();
     void formMKB();
     void updateDataCollection(int step);
-    DivergenceGridFunctionCoefficient * div(VectorCoefficient &vc);
+    void updateVars();
+    Coefficient * div(VectorCoefficient &vc);
+    Coefficient * poissonBracket(GridFunction &gf);
     
     // Simulation parameters
     real_t _max_t;
     real_t _dt;
+    real_t _xL;
+    real_t _yL;
     int _nstep;
     int _order;
     int _ref_levels;
@@ -33,7 +35,7 @@ public:
     // Physical parameters
     ConstantCoefficient _Binv; // Factor in front of Poisson brackets
     real_t _Lambda; // Factor in the exponential term
-    real_t _kh3; // Factor in front of the third term containing the thermal exponential
+    real_t _kh0; // Factor in front of the omega test term containing the thermal exponential
 
     // System matrix and RHS
     std::unique_ptr<BlockOperator> _M;
@@ -45,9 +47,8 @@ public:
     std::unique_ptr<ParGridFunction> _phi;
     std::unique_ptr<ParGridFunction> _omega;
     std::unique_ptr<ParGridFunction> _T;
-
-    std::unique_ptr<ParGridFunction> _dt_omega;
-    std::unique_ptr<ParGridFunction> _dt_T;
+    std::unique_ptr<ParGridFunction> _n;
+    std::unique_ptr<BlockVector> _var_blocks;
 
     Array<int> _block_offsets;
 
@@ -57,7 +58,12 @@ private:
     void buildGridFunctions();
     void setInitialConditions();
     void setOutput();
+    void updatePhi();
+    void updateVd();
     void updateThermalExponential();
+    void updateLFCoefs();
+    void makeRadialCoefficient();
+    void makeSn();
     
     // FES
     std::unique_ptr<ParFiniteElementSpace> _h1_fes;
@@ -75,8 +81,16 @@ private:
     std::unique_ptr<GridFunctionCoefficient> _phi_gfcoef;
     std::unique_ptr<GridFunctionCoefficient> _T_gfcoef;
 
+    // Some useful coefficients for the linear forms
+    std::unique_ptr<Coefficient> _r; 
+    std::unique_ptr<Coefficient> _Sn;
+
     std::unique_ptr<TransformedCoefficient> _thermal_exp;
-    std::unique_ptr<Coefficient> _KH3_coef;
+    std::unique_ptr<Coefficient> _KH0_coef;
+    std::unique_ptr<Coefficient> _KH1_coef;
+    std::unique_ptr<Coefficient> _omega_LF_coef;
+    std::unique_ptr<Coefficient> _T_LF_coef;
+    std::unique_ptr<Coefficient> _n_LF_coef;
 
     // Data collection
     std::unique_ptr<ParaViewDataCollection> _visit_dc;
