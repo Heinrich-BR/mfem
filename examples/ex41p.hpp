@@ -29,6 +29,7 @@ public:
    int _order;
    int _ref_levels;
    int _dim = 2;
+   real_t _eps2 = 1e-12;
 
    // Mesh
    std::unique_ptr<ParMesh> _pmesh;
@@ -36,7 +37,6 @@ public:
    // Physical parameters
    ConstantCoefficient _Binv; // Factor in front of Poisson brackets
    real_t _Lambda; // Factor in the exponential term
-   real_t _kh0; // Factor in front of the omega test term containing the thermal exponential
 
    // System matrix and RHS
    std::unique_ptr<BlockOperator> _M;
@@ -81,17 +81,20 @@ private:
 
    std::unique_ptr<GridFunctionCoefficient> _phi_gfcoef;
    std::unique_ptr<GridFunctionCoefficient> _T_gfcoef;
+   std::unique_ptr<GridFunctionCoefficient> _n_gfcoef;
 
    // Some useful coefficients for the linear forms
    std::unique_ptr<Coefficient> _r;
    std::unique_ptr<Coefficient> _Sn;
 
    std::unique_ptr<TransformedCoefficient> _thermal_exp;
-   std::unique_ptr<Coefficient> _KH0_coef;
-   std::unique_ptr<Coefficient> _KH1_coef;
    std::unique_ptr<Coefficient> _omega_LF_coef;
    std::unique_ptr<Coefficient> _T_LF_coef;
    std::unique_ptr<Coefficient> _n_LF_coef;
+
+   std::unique_ptr<Coefficient> _poisson_omega;
+   std::unique_ptr<Coefficient> _poisson_T;
+   std::unique_ptr<Coefficient> _poisson_n;
 
    // Data collection
    std::unique_ptr<ParaViewDataCollection> _visit_dc;

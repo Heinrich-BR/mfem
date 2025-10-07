@@ -13,8 +13,8 @@ int main(int argc, char *argv[])
    // Simulation parameters
    int order = 1;
    int ref_levels = 0;
-   int nstep = 10;
-   real_t max_t = 12;
+   int nstep = 50;
+   real_t max_t = 2.4;
    real_t xL = 1.2;
    real_t yL = 1.2;
 
@@ -29,7 +29,7 @@ int main(int argc, char *argv[])
                      ricci._pmesh->GetComm());
 
    // Set up the ODE solver
-   std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(1);
+   std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(2);
    ode_solver->Init(t_op);
 
    real_t t = 0.0;
@@ -73,7 +73,6 @@ Ricci2D::Ricci2D(int order, int ref_levels, real_t xL, real_t yL, real_t max_t,
    _yL(yL),
    _Binv(40.0),
    _Lambda(3.0),
-   _kh0(1.0/24.0),
    _rotmat({{0, -1},{1, 0}}),
 _grad_rotate{std::make_unique<MatrixConstantCoefficient>(_rotmat)}
 {
@@ -81,6 +80,7 @@ _grad_rotate{std::make_unique<MatrixConstantCoefficient>(_rotmat)}
    buildMesh(xL, yL);
    buildGridFunctions();
    makeRadialCoefficient();
+   makeSn();
    setInitialConditions();
    setOutput();
 
@@ -170,21 +170,55 @@ void Ricci2D::updateThermalExponential()
    _thermal_exp.reset(new TransformedCoefficient(
                          _phi_gfcoef.get(),
                          _T_gfcoef.get(),
-   [this](real_t phi, real_t T) { return exp(_Lambda - phi / T); }
+   [this](real_t phi, real_t T) { return exp(_Lambda - phi / sqrt(pow(T,2)+_eps2)); }
                       ));
 
 }
 
 void Ricci2D::updateLFCoefs()
 {
-   _KH0_coef.reset(new SumCoefficient(_one, *_thermal_exp, -_kh0,
-                                      _kh0)); // Check potential sign issues!
-   _omega_LF_coef.reset(new SumCoefficient(*poissonBracket(*_omega), *_KH0_coef,
-                                           _Binv.constant, 1.0));
+   _poisson_omega.reset(poissonBracket(*_omega));
+   _poisson_T.reset(poissonBracket(*_T));
+   _poisson_n.reset(poissonBracket(*_n));
 
-   _KH1_coef.reset(new SumCoefficient(*_thermal_exp, _one, 1.71, -0.71));
-   _T_LF_coef.reset(new SumCoefficient(*poissonBracket(*_T), *_KH1_coef,
-                                       _Binv.constant, -1.0));
+   // Omega term
+   // Check potential sign issues!
+
+   _omega_LF_coef.reset(new TransformedCoefficient(
+                           _thermal_exp.get(),
+                           _poisson_omega.get(),
+                           [this](real_t exp_term, real_t poisson)
+   {
+      return _Binv.constant * poisson + (1./24.) * (1-exp_term);
+   }
+                        ));
+
+   // T term
+   _T_LF_coef.reset(new TransformedCoefficient(
+                       new TransformedCoefficient(_thermal_exp.get(),
+                                                  _T_gfcoef.get(),
+                                                  [this] (real_t thermal_exp, real_t T)
+   {
+      return (1.71 * thermal_exp - 0.71) * T;
+   }),
+   new SumCoefficient(*_poisson_T, *_Sn, _Binv.constant, 1.0),
+   [this](real_t thermal_term, real_t poisson_source)
+   {
+      return poisson_source - (1./36.) * thermal_term;
+   }
+                    ));
+
+   // n term
+   _n_gfcoef.reset(new GridFunctionCoefficient(_n.get()));
+
+   _n_LF_coef.reset(new TransformedCoefficient(
+                       new ProductCoefficient(*_thermal_exp, *_n_gfcoef),
+                       new SumCoefficient(*_poisson_n, *_Sn, _Binv.constant, 1.0),
+                       [this](real_t thermal_term, real_t poisson_source)
+   {
+      return poisson_source - (1./24.) * thermal_term;
+   }
+                    ));
 }
 
 void Ricci2D::updateVars()
@@ -268,7 +302,6 @@ void Ricci2D::formMKB()
    k_11->Assemble();
    k_11->Finalize();
 
-   _T_LF_coef.reset(new ConstantCoefficient(1.0));
    b_1->AddDomainIntegrator(new DomainLFIntegrator(*_T_LF_coef));
    b_1->Assemble();
 
@@ -289,15 +322,12 @@ void Ricci2D::formMKB()
    k_22->Assemble();
    k_22->Finalize();
 
-   _n_LF_coef.reset(new ConstantCoefficient(1.0));
    b_2->AddDomainIntegrator(new DomainLFIntegrator(*_n_LF_coef));
    b_2->Assemble();
 
    _M->SetBlock(2, 2, m_22);
    _K->SetBlock(2, 2, k_22);
    _B->GetBlock(2) = *b_2;
-
-
 }
 
 void Ricci2D::buildMesh(real_t xL, real_t yL)
