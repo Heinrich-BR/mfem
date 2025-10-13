@@ -30,6 +30,7 @@ public:
    int _ref_levels;
    int _dim = 2;
    real_t _eps2 = 1e-12;
+   real_t _h;
 
    // Mesh
    std::unique_ptr<ParMesh> _pmesh;
@@ -65,6 +66,7 @@ private:
    void updateLFCoefs();
    void makeRadialCoefficient();
    void makeSn();
+   void updateSUWCoefficient(const std::unique_ptr<ParGridFunction> & gf, std::unique_ptr<Coefficient> & coef);
 
    // FES
    std::unique_ptr<ParFiniteElementSpace> _h1_fes;
@@ -91,6 +93,10 @@ private:
    std::unique_ptr<Coefficient> _omega_LF_coef;
    std::unique_ptr<Coefficient> _T_LF_coef;
    std::unique_ptr<Coefficient> _n_LF_coef;
+
+   std::unique_ptr<Coefficient> _omega_SUW_coef;
+   std::unique_ptr<Coefficient> _T_SUW_coef;
+   std::unique_ptr<Coefficient> _n_SUW_coef;
 
    std::unique_ptr<Coefficient> _poisson_omega;
    std::unique_ptr<Coefficient> _poisson_T;

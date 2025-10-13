@@ -12,7 +12,7 @@ int main(int argc, char *argv[])
 
    // Simulation parameters
    int order = 1;
-   int ref_levels = 0;
+   int ref_levels = 1;
    int nstep = 50;
    real_t max_t = 2.4;
    real_t xL = 1.2;
@@ -29,7 +29,7 @@ int main(int argc, char *argv[])
                      ricci._pmesh->GetComm());
 
    // Set up the ODE solver
-   std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(2);
+   std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(1);
    ode_solver->Init(t_op);
 
    real_t t = 0.0;
@@ -115,6 +115,17 @@ void Ricci2D::makeSn()
       return 0.03*(1-tanh( (r_norm-20)/0.5 ));
    }
              ));
+}
+
+void Ricci2D::updateSUWCoefficient(const std::unique_ptr<ParGridFunction> & gf, std::unique_ptr<Coefficient> & coef)
+{
+   GradientGridFunctionCoefficient grad_gf(gf.get());
+   InnerProductCoefficient vd_grad_gf(*_vd, grad_gf);
+   NormalizedVectorCoefficient norm_vd(*_vd, _eps2);
+   ScalarVectorProductCoefficient vd_grad_gf_dir_vd(vd_grad_gf, norm_vd);
+   ScalarVectorProductCoefficient scaled(-_h/2.0, vd_grad_gf_dir_vd);
+   
+   coef.reset(div(scaled));
 }
 
 void Ricci2D::Save()
@@ -219,6 +230,10 @@ void Ricci2D::updateLFCoefs()
       return poisson_source - (1./24.) * thermal_term;
    }
                     ));
+
+   updateSUWCoefficient(_omega, _omega_SUW_coef);
+   updateSUWCoefficient(_T, _T_SUW_coef);
+   updateSUWCoefficient(_n, _n_SUW_coef);
 }
 
 void Ricci2D::updateVars()
@@ -283,6 +298,7 @@ void Ricci2D::formMKB()
    k_00->Finalize();
 
    b_0->AddDomainIntegrator(new DomainLFIntegrator(*_omega_LF_coef));
+   b_0->AddDomainIntegrator(new DomainLFIntegrator(*_omega_SUW_coef));
    b_0->Assemble();
 
    _M->SetBlock(0, 0, m_00);
@@ -303,6 +319,7 @@ void Ricci2D::formMKB()
    k_11->Finalize();
 
    b_1->AddDomainIntegrator(new DomainLFIntegrator(*_T_LF_coef));
+   b_1->AddDomainIntegrator(new DomainLFIntegrator(*_T_SUW_coef));
    b_1->Assemble();
 
    _M->SetBlock(1, 1, m_11);
@@ -323,6 +340,7 @@ void Ricci2D::formMKB()
    k_22->Finalize();
 
    b_2->AddDomainIntegrator(new DomainLFIntegrator(*_n_LF_coef));
+   b_2->AddDomainIntegrator(new DomainLFIntegrator(*_n_SUW_coef));
    b_2->Assemble();
 
    _M->SetBlock(2, 2, m_22);
@@ -340,6 +358,7 @@ void Ricci2D::buildMesh(real_t xL, real_t yL)
    }
 
    _pmesh = std::make_unique<ParMesh>(MPI_COMM_WORLD, mesh);
+   _h = _pmesh->GetElementSize(_pmesh->GetTypicalElementTransformation());
 }
 
 void Ricci2D::buildGridFunctions()
