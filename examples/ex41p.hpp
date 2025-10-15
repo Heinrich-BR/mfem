@@ -81,6 +81,9 @@ private:
    std::unique_ptr<MatrixConstantCoefficient> _grad_rotate;
    std::unique_ptr<MatrixVectorProductCoefficient> _vd;
 
+   std::unique_ptr<ParGridFunction> _vd_test_gf;
+   std::unique_ptr<ParGridFunction> _Sn_test_gf;
+
    std::unique_ptr<GridFunctionCoefficient> _phi_gfcoef;
    std::unique_ptr<GridFunctionCoefficient> _T_gfcoef;
    std::unique_ptr<GridFunctionCoefficient> _n_gfcoef;
@@ -103,7 +106,7 @@ private:
    std::unique_ptr<Coefficient> _poisson_n;
 
    // Data collection
-   std::unique_ptr<ParaViewDataCollection> _visit_dc;
+   std::unique_ptr<ParaViewDataCollection> _dc;
 };
 
 class FE_Evolution : public TimeDependentOperator

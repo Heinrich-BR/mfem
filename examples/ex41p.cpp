@@ -12,11 +12,13 @@ int main(int argc, char *argv[])
 
    // Simulation parameters
    int order = 1;
-   int ref_levels = 1;
-   int nstep = 50;
-   real_t max_t = 2.4;
-   real_t xL = 1.2;
-   real_t yL = 1.2;
+   int ref_levels = 0;
+   real_t xL = 1.0; // Lengths measured in units of 100*rho_s0
+   real_t yL = 1.0;
+
+   int nstep = 1200;
+   real_t max_t = 2.44;
+
 
    // Create the Ricci2D problem and obtain initial values
    Ricci2D ricci(order, ref_levels, xL, yL, max_t, nstep);
@@ -46,6 +48,7 @@ int main(int argc, char *argv[])
 
       ode_solver->Step(*ricci._var_blocks, t, ricci._dt);
       ricci.updateVars();
+      std::cout << "t = " << t << std::endl;
       std::cout << "Omega Norml2 = " << ricci._omega->Norml2() << std::endl;
       std::cout << "T Norml2 = "     << ricci._T->Norml2() << std::endl;
       std::cout << "n Norml2 = "     << ricci._n->Norml2() << std::endl;
@@ -105,7 +108,7 @@ void Ricci2D::makeSn()
 {
    // Source term S_n, which in the normalised equations is equal to S_T
 
-   real_t r_unit = 0.5;
+   real_t r_unit = 1e-2; // 100 rho_s0 in normalised units
 
    _Sn.reset(new TransformedCoefficient(
                 _r.get(),
@@ -115,6 +118,8 @@ void Ricci2D::makeSn()
       return 0.03*(1-tanh( (r_norm-20)/0.5 ));
    }
              ));
+
+   _Sn_test_gf->ProjectCoefficient(*_Sn);
 }
 
 void Ricci2D::updateSUWCoefficient(const std::unique_ptr<ParGridFunction> & gf, std::unique_ptr<Coefficient> & coef)
@@ -123,20 +128,22 @@ void Ricci2D::updateSUWCoefficient(const std::unique_ptr<ParGridFunction> & gf, 
    InnerProductCoefficient vd_grad_gf(*_vd, grad_gf);
    NormalizedVectorCoefficient norm_vd(*_vd, _eps2);
    ScalarVectorProductCoefficient vd_grad_gf_dir_vd(vd_grad_gf, norm_vd);
-   ScalarVectorProductCoefficient scaled(-_h/2.0, vd_grad_gf_dir_vd);
+   ScalarVectorProductCoefficient scaled(_h/2.0, vd_grad_gf_dir_vd);
    
    coef.reset(div(scaled));
 }
 
 void Ricci2D::Save()
 {
-   _visit_dc->Save();
+   _dc->Save();
 }
 
 void Ricci2D::updateVd()
 {
    _grad_phi.reset(new GradientGridFunctionCoefficient(_phi.get()));
    _vd.reset(new MatrixVectorProductCoefficient(*_grad_rotate, *_grad_phi));
+
+   _vd_test_gf->ProjectCoefficient(*_vd);
 }
 
 void Ricci2D::updatePhi()
@@ -155,7 +162,8 @@ void Ricci2D::updatePhi()
 
    ParLinearForm b(_h1_fes.get());
    GridFunctionCoefficient _omega_coef(_omega.get());
-   b.AddDomainIntegrator(new DomainLFIntegrator(_omega_coef));
+   ProductCoefficient _neg_omega_coef(-1.0, _omega_coef);
+   b.AddDomainIntegrator(new DomainLFIntegrator(_neg_omega_coef));
    b.Assemble();
    OperatorPtr _A;
    Vector B, X;
@@ -166,7 +174,7 @@ void Ricci2D::updatePhi()
    CGSolver cg(MPI_COMM_WORLD);
    cg.SetRelTol(1e-12);
    cg.SetMaxIter(2000);
-   cg.SetPrintLevel(1);
+   cg.SetPrintLevel(0);
    if (_prec) { cg.SetPreconditioner(_prec); }
    cg.SetOperator(*_A);
    cg.Mult(B, X);
@@ -200,7 +208,7 @@ void Ricci2D::updateLFCoefs()
                            _poisson_omega.get(),
                            [this](real_t exp_term, real_t poisson)
    {
-      return _Binv.constant * poisson + (1./24.) * (1-exp_term);
+      return _Binv.constant * poisson - (1./24.) * (1-exp_term);
    }
                         ));
 
@@ -374,6 +382,9 @@ void Ricci2D::buildGridFunctions()
    _T = std::make_unique<ParGridFunction>(_h1_fes.get());
    _n = std::make_unique<ParGridFunction>(_h1_fes.get());
 
+   _vd_test_gf = std::make_unique<ParGridFunction>(_hdiv_fes.get());
+   _Sn_test_gf = std::make_unique<ParGridFunction>(_h1_fes.get());
+
    // Intermediate gf for computing the divergence of v_d
    _hdiv_gf = std::make_unique<ParGridFunction>(_hdiv_fes.get());
 
@@ -392,19 +403,22 @@ void Ricci2D::setInitialConditions()
 
 void Ricci2D::setOutput()
 {
-   _visit_dc = std::make_unique<ParaViewDataCollection>("Ricci2D/Step",
+   _dc = std::make_unique<ParaViewDataCollection>("Ricci2D/Step",
                                                         _pmesh.get());
-   _visit_dc->RegisterField("phi", _phi.get());
-   _visit_dc->RegisterField("omega", _omega.get());
-   _visit_dc->RegisterField("T", _T.get());
-   _visit_dc->RegisterField("n", _n.get());
+   _dc->RegisterField("phi", _phi.get());
+   _dc->RegisterField("omega", _omega.get());
+   _dc->RegisterField("T", _T.get());
+   _dc->RegisterField("n", _n.get());
+
+   _dc->RegisterField("Vd", _vd_test_gf.get());
+   _dc->RegisterField("Sn", _Sn_test_gf.get());
 }
 
 void Ricci2D::updateDataCollection(int step)
 {
 
-   _visit_dc->SetCycle(step);
-   _visit_dc->SetTime(step*_dt);
+   _dc->SetCycle(step);
+   _dc->SetTime(step*_dt);
 }
 
 
