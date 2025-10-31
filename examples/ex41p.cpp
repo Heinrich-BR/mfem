@@ -11,13 +11,13 @@ int main(int argc, char *argv[])
 
 
    // Simulation parameters
-   int order = 1;
-   int ref_levels = 0;
+   int order = 2;
+   int ref_levels = 1;
    real_t xL = 1.0; // Lengths measured in units of 100*rho_s0
    real_t yL = 1.0;
 
-   int nstep = 1200;
-   real_t max_t = 2.44;
+   int nstep = 100;
+   real_t max_t = 3.0;
 
 
    // Create the Ricci2D problem and obtain initial values
@@ -27,11 +27,11 @@ int main(int argc, char *argv[])
    ricci.Save();
 
    // Create the time evolution operator
-   FE_Evolution t_op(*ricci._M, *ricci._K, ricci._B.get(), ricci._block_offsets,
+   FE_Evolution t_op(ricci._M, ricci._K, ricci._B, ricci._block_offsets,
                      ricci._pmesh->GetComm());
 
    // Set up the ODE solver
-   std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(1);
+   std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(21);
    ode_solver->Init(t_op);
 
    real_t t = 0.0;
@@ -43,16 +43,19 @@ int main(int argc, char *argv[])
       if (s!=0)
       {
          ricci.formMKB();
-         t_op.updateMKB(*ricci._M, *ricci._K, ricci._B.get());
+         t_op.updateMKB(ricci._M, ricci._K, ricci._B);
       }
 
       ode_solver->Step(*ricci._var_blocks, t, ricci._dt);
       ricci.updateVars();
+      std::cout << "--------------------------" << std::endl;
       std::cout << "t = " << t << std::endl;
+      std::cout << "--------------------------" << std::endl;
       std::cout << "Omega Norml2 = " << ricci._omega->Norml2() << std::endl;
-      std::cout << "T Norml2 = "     << ricci._T->Norml2() << std::endl;
-      std::cout << "n Norml2 = "     << ricci._n->Norml2() << std::endl;
-      std::cout << "Phi Norml2 = "   << ricci._phi->Norml2() << std::endl;
+      std::cout << "T Norml2     = "     << ricci._T->Norml2() << std::endl;
+      std::cout << "n Norml2     = "     << ricci._n->Norml2() << std::endl;
+      std::cout << "Phi Norml2   = "   << ricci._phi->Norml2() << std::endl;
+      std::cout << "---------------------------" << std::endl;
 
       ricci.updateDataCollection(s+1);
       ricci.Save();
@@ -76,10 +79,12 @@ Ricci2D::Ricci2D(int order, int ref_levels, real_t xL, real_t yL, real_t max_t,
    _yL(yL),
    _Binv(40.0),
    _Lambda(3.0),
+   _S_0n(0.03),
    _rotmat({{0, -1},{1, 0}}),
-_grad_rotate{std::make_unique<MatrixConstantCoefficient>(_rotmat)}
+   _grad_rotate{std::make_unique<MatrixConstantCoefficient>(_rotmat)}
 {
    _dt = _max_t / _nstep;
+   _dt_coef = std::make_unique<ConstantCoefficient>(_dt);
    buildMesh(xL, yL);
    buildGridFunctions();
    makeRadialCoefficient();
@@ -102,6 +107,9 @@ void Ricci2D::makeRadialCoefficient()
                new CartesianYCoefficient,
    [this](real_t x, real_t y) { return sqrt(pow((x-_xL/2),2)+pow((y-_yL/2),2));}
             ));
+   
+   _r_test_gf = std::make_unique<ParGridFunction>(_h1_fes.get());
+   _r_test_gf->ProjectCoefficient(*_r);
 }
 
 void Ricci2D::makeSn()
@@ -112,25 +120,14 @@ void Ricci2D::makeSn()
 
    _Sn.reset(new TransformedCoefficient(
                 _r.get(),
-                [r_unit](real_t r)
+                [r_unit, this](real_t r)
    {
       real_t r_norm = r/r_unit;
-      return 0.03*(1-tanh( (r_norm-20)/0.5 ));
+      return _S_0n*(1-tanh( (r_norm-20)/0.5 ))/2.0;
    }
              ));
 
    _Sn_test_gf->ProjectCoefficient(*_Sn);
-}
-
-void Ricci2D::updateSUWCoefficient(const std::unique_ptr<ParGridFunction> & gf, std::unique_ptr<Coefficient> & coef)
-{
-   GradientGridFunctionCoefficient grad_gf(gf.get());
-   InnerProductCoefficient vd_grad_gf(*_vd, grad_gf);
-   NormalizedVectorCoefficient norm_vd(*_vd, _eps2);
-   ScalarVectorProductCoefficient vd_grad_gf_dir_vd(vd_grad_gf, norm_vd);
-   ScalarVectorProductCoefficient scaled(_h/2.0, vd_grad_gf_dir_vd);
-   
-   coef.reset(div(scaled));
 }
 
 void Ricci2D::Save()
@@ -143,6 +140,10 @@ void Ricci2D::updateVd()
    _grad_phi.reset(new GradientGridFunctionCoefficient(_phi.get()));
    _vd.reset(new MatrixVectorProductCoefficient(*_grad_rotate, *_grad_phi));
 
+   _norm_vd.reset(new NormalizedVectorCoefficient(*_vd, _eps2));
+   _scaled_norm_vd.reset(new ScalarVectorProductCoefficient(_h/2.0, *_norm_vd));
+   _div_vd.reset(div(*_vd));
+   _div_vd_scaled.reset(new ProductCoefficient(-_Binv, *_div_vd));
    _vd_test_gf->ProjectCoefficient(*_vd);
 }
 
@@ -181,75 +182,97 @@ void Ricci2D::updatePhi()
    a.RecoverFEMSolution(X, b, *_phi);
 }
 
-void Ricci2D::updateThermalExponential()
+void Ricci2D::updateGFCoefs()
 {
-   _phi_gfcoef.reset(new GridFunctionCoefficient(_phi.get()));
+   _n_gfcoef.reset(new GridFunctionCoefficient(_n.get()));
    _T_gfcoef.reset(new GridFunctionCoefficient(_T.get()));
+   _omega_gfcoef.reset(new GridFunctionCoefficient(_omega.get()));
+   _phi_gfcoef.reset(new GridFunctionCoefficient(_phi.get()));
+}
 
+void Ricci2D::updateBLFCoefs()
+{
+   // Update the thermal exponential coefficient to simplify some expressions
    _thermal_exp.reset(new TransformedCoefficient(
-                         _phi_gfcoef.get(),
-                         _T_gfcoef.get(),
-   [this](real_t phi, real_t T) { return exp(_Lambda - phi / sqrt(pow(T,2)+_eps2)); }
-                      ));
+                 _T_gfcoef.get(), _phi_gfcoef.get(),
+   [this](real_t T, real_t phi)
+   { return exp(_Lambda-phi/sqrt(T*T+_eps2)); }
+              ));
+
+   // Update the streamline upwinding coefficient
+   _SUW_matcoef.reset(new OuterProductCoefficient(*_vd, *_scaled_norm_vd));
+
+   // Update the Gateaux derivative coefficients
+   _DnFn.reset(new TransformedCoefficient(
+                    _thermal_exp.get(),
+   [this](real_t exp_term)
+   { return (_dt/24.)*exp_term; }
+                 ));
+   
+   _DTFw.reset(new TransformedCoefficient(
+                    _T_gfcoef.get(), _phi_gfcoef.get(),
+   [this](real_t T, real_t phi)
+   { return (-_dt/24.)*exp(_Lambda-phi/sqrt(T*T+_eps2))*phi/(T*T+_eps2); }
+                 ));
+
+   _DTFn.reset(new TransformedCoefficient(
+                    _n_gfcoef.get(), _DTFw.get(),
+   [this](real_t n, real_t DTFw)
+   { return -DTFw*n; }
+                 ));
+   
+   _DTFT.reset(new TransformedCoefficient(
+                    _T_gfcoef.get(), _phi_gfcoef.get(),
+   [this](real_t T, real_t phi)
+   { return (_dt/36.)*(1.71*exp(_Lambda-phi/sqrt(T*T+_eps2))-0.71)+_dt*0.0475*exp(_Lambda-phi/sqrt(T*T+_eps2))*phi/sqrt(T*T+_eps2); }
+                 ));
 
 }
 
 void Ricci2D::updateLFCoefs()
 {
-   _poisson_omega.reset(poissonBracket(*_omega));
-   _poisson_T.reset(poissonBracket(*_T));
-   _poisson_n.reset(poissonBracket(*_n));
+   _n_DnFn.reset(new ProductCoefficient(*_n_gfcoef, *_DnFn));
+   _T_DTFn.reset(new ProductCoefficient(*_T_gfcoef, *_DTFn));
+   _T_DTFT.reset(new ProductCoefficient(*_T_gfcoef, *_DTFT));
+   _T_DTFw.reset(new ProductCoefficient(*_T_gfcoef, *_DTFw));
+   
+   _Fn_no_source.reset(new TransformedCoefficient(
+                 _n_gfcoef.get(), _thermal_exp.get(),
+   [this](real_t n, real_t exp_term)
+   { return (n/24.)*exp_term; }
+              ));
+   
+   _Fn.reset(new TransformedCoefficient(
+                 _Fn_no_source.get(), _Sn.get(),
+   [this](real_t Fn_no_source, real_t Sn)
+   { return Fn_no_source - Sn; }
+              ));
 
-   // Omega term
-   // Check potential sign issues!
+   _FT_no_source.reset(new TransformedCoefficient(
+                 _T_gfcoef.get(), _thermal_exp.get(),
+   [this](real_t T, real_t exp_term)
+   { return (T/36.)*(1.71*exp_term-0.71); }
+              ));
 
-   _omega_LF_coef.reset(new TransformedCoefficient(
-                           _thermal_exp.get(),
-                           _poisson_omega.get(),
-                           [this](real_t exp_term, real_t poisson)
-   {
-      return _Binv.constant * poisson - (1./24.) * (1-exp_term);
-   }
-                        ));
+   _FT.reset(new TransformedCoefficient(
+                 _FT_no_source.get(), _Sn.get(),
+   [this](real_t FT_no_source, real_t Sn)
+   { return FT_no_source - Sn; }
+              ));
 
-   // T term
-   _T_LF_coef.reset(new TransformedCoefficient(
-                       new TransformedCoefficient(_thermal_exp.get(),
-                                                  _T_gfcoef.get(),
-                                                  [this] (real_t thermal_exp, real_t T)
-   {
-      return (1.71 * thermal_exp - 0.71) * T;
-   }),
-   new SumCoefficient(*_poisson_T, *_Sn, _Binv.constant, 1.0),
-   [this](real_t thermal_term, real_t poisson_source)
-   {
-      return poisson_source - (1./36.) * thermal_term;
-   }
-                    ));
+   _Fw.reset(new TransformedCoefficient(
+                 _thermal_exp.get(),
+   [this](real_t exp_term)
+   { return (1./24.)*(1.-exp_term); }
+              ));
 
-   // n term
-   _n_gfcoef.reset(new GridFunctionCoefficient(_n.get()));
-
-   _n_LF_coef.reset(new TransformedCoefficient(
-                       new ProductCoefficient(*_thermal_exp, *_n_gfcoef),
-                       new SumCoefficient(*_poisson_n, *_Sn, _Binv.constant, 1.0),
-                       [this](real_t thermal_term, real_t poisson_source)
-   {
-      return poisson_source - (1./24.) * thermal_term;
-   }
-                    ));
-
-   updateSUWCoefficient(_omega, _omega_SUW_coef);
-   updateSUWCoefficient(_T, _T_SUW_coef);
-   updateSUWCoefficient(_n, _n_SUW_coef);
 }
 
 void Ricci2D::updateVars()
 {
-
-   *_omega = _var_blocks->GetBlock(0);
+   *_n = _var_blocks->GetBlock(0);
    *_T = _var_blocks->GetBlock(1);
-   *_n = _var_blocks->GetBlock(2);
+   *_omega = _var_blocks->GetBlock(2);
 }
 
 Coefficient * Ricci2D::div(VectorCoefficient &vc)
@@ -258,18 +281,12 @@ Coefficient * Ricci2D::div(VectorCoefficient &vc)
    return new DivergenceGridFunctionCoefficient(_hdiv_gf.get());
 }
 
-Coefficient * Ricci2D::poissonBracket(GridFunction &gf)
-{
-   GridFunctionCoefficient _gfcoef(&gf);
-   ScalarVectorProductCoefficient gf_vd(_gfcoef, *_vd);
-   return div(gf_vd);
-}
-
 void Ricci2D::formMKB()
 {
    updatePhi();
    updateVd();
-   updateThermalExponential();
+   updateGFCoefs();
+   updateBLFCoefs();
    updateLFCoefs();
 
    // Make system blocks
@@ -288,72 +305,95 @@ void Ricci2D::formMKB()
    _K->owns_blocks = true;
 
    _var_blocks.reset(new BlockVector(_block_offsets));
-   _var_blocks->GetBlock(0) = *_omega;
+   _var_blocks->GetBlock(0) = *_n;
    _var_blocks->GetBlock(1) = *_T;
-   _var_blocks->GetBlock(2) = *_n;
-
-   // Omega terms
+   _var_blocks->GetBlock(2) = *_omega;
+   
+   // Diagonal n terms
 
    ParBilinearForm * m_00 = new ParBilinearForm(_h1_fes.get());
    ParBilinearForm * k_00 = new ParBilinearForm(_h1_fes.get());
    ParLinearForm * b_0 = new ParLinearForm(_h1_fes.get());
 
-   m_00->AddDomainIntegrator(new MassIntegrator);
+   m_00->AddDomainIntegrator(new MassIntegrator); // Time derivative term
+   m_00->AddDomainIntegrator(new MassIntegrator(*_DnFn)); // Gateaux derivative term, already scaled by dt
    m_00->Assemble();
    m_00->Finalize();
 
+   k_00->AddDomainIntegrator(new ConvectionIntegrator(*_vd, -_Binv)); // Poisson bracket first term
+   k_00->AddDomainIntegrator(new MassIntegrator(*_div_vd_scaled)); // Poisson bracket second term
+   k_00->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef)); // SUW term
    k_00->Assemble();
    k_00->Finalize();
 
-   b_0->AddDomainIntegrator(new DomainLFIntegrator(*_omega_LF_coef));
-   b_0->AddDomainIntegrator(new DomainLFIntegrator(*_omega_SUW_coef));
+   b_0->AddDomainIntegrator(new DomainLFIntegrator(*_Fn));
    b_0->Assemble();
 
    _M->SetBlock(0, 0, m_00);
    _K->SetBlock(0, 0, k_00);
    _B->GetBlock(0) = *b_0;
 
-   // T terms
+   // Diagonal T terms
 
    ParBilinearForm * m_11 = new ParBilinearForm(_h1_fes.get());
    ParBilinearForm * k_11 = new ParBilinearForm(_h1_fes.get());
    ParLinearForm * b_1 = new ParLinearForm(_h1_fes.get());
 
-   m_11->AddDomainIntegrator(new MassIntegrator);
+   m_11->AddDomainIntegrator(new MassIntegrator); // Time derivative term
+   m_11->AddDomainIntegrator(new MassIntegrator(*_DTFT)); // Gateaux derivative term, already scaled by dt
    m_11->Assemble();
    m_11->Finalize();
 
+   k_11->AddDomainIntegrator(new ConvectionIntegrator(*_vd, -_Binv)); // Poisson bracket first term
+   k_11->AddDomainIntegrator(new MassIntegrator(*_div_vd_scaled)); // Poisson bracket second term
+   k_11->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef)); // SUW term
    k_11->Assemble();
    k_11->Finalize();
 
-   b_1->AddDomainIntegrator(new DomainLFIntegrator(*_T_LF_coef));
-   b_1->AddDomainIntegrator(new DomainLFIntegrator(*_T_SUW_coef));
+   b_1->AddDomainIntegrator(new DomainLFIntegrator(*_FT));
    b_1->Assemble();
 
    _M->SetBlock(1, 1, m_11);
    _K->SetBlock(1, 1, k_11);
    _B->GetBlock(1) = *b_1;
 
-   // n terms
+   // Diagonal Omega terms
 
    ParBilinearForm * m_22 = new ParBilinearForm(_h1_fes.get());
    ParBilinearForm * k_22 = new ParBilinearForm(_h1_fes.get());
    ParLinearForm * b_2 = new ParLinearForm(_h1_fes.get());
 
-   m_22->AddDomainIntegrator(new MassIntegrator);
+   m_22->AddDomainIntegrator(new MassIntegrator); // Time derivative term
    m_22->Assemble();
    m_22->Finalize();
 
+   k_22->AddDomainIntegrator(new ConvectionIntegrator(*_vd, -_Binv)); // Poisson bracket first term
+   k_22->AddDomainIntegrator(new MassIntegrator(*_div_vd_scaled)); // Poisson bracket second term
+   k_22->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef)); // SUW term
    k_22->Assemble();
    k_22->Finalize();
 
-   b_2->AddDomainIntegrator(new DomainLFIntegrator(*_n_LF_coef));
-   b_2->AddDomainIntegrator(new DomainLFIntegrator(*_n_SUW_coef));
+   b_2->AddDomainIntegrator(new DomainLFIntegrator(*_Fw));
    b_2->Assemble();
 
    _M->SetBlock(2, 2, m_22);
    _K->SetBlock(2, 2, k_22);
    _B->GetBlock(2) = *b_2;
+
+   // Off-diagonal terms
+
+   ParBilinearForm * m_01 = new ParBilinearForm(_h1_fes.get());
+   m_01->AddDomainIntegrator(new MassIntegrator(*_DTFn)); // Gateaux derivative term, already scaled by dt
+   m_01->Assemble();
+   m_01->Finalize();
+   _M->SetBlock(0, 1, m_01);
+
+   ParBilinearForm * m_21 = new ParBilinearForm(_h1_fes.get());
+   m_21->AddDomainIntegrator(new MassIntegrator(*_DTFw)); // Gateaux derivative term, already scaled by dt
+   m_21->Assemble();
+   m_21->Finalize();
+   _M->SetBlock(2, 1, m_21);
+
 }
 
 void Ricci2D::buildMesh(real_t xL, real_t yL)
@@ -412,11 +452,11 @@ void Ricci2D::setOutput()
 
    _dc->RegisterField("Vd", _vd_test_gf.get());
    _dc->RegisterField("Sn", _Sn_test_gf.get());
+   _dc->RegisterField("r", _r_test_gf.get());
 }
 
 void Ricci2D::updateDataCollection(int step)
 {
-
    _dc->SetCycle(step);
    _dc->SetTime(step*_dt);
 }
@@ -424,9 +464,9 @@ void Ricci2D::updateDataCollection(int step)
 
 // FE_Evolution methods
 
-FE_Evolution::FE_Evolution(BlockOperator &M, BlockOperator &K, BlockVector * b,
+FE_Evolution::FE_Evolution(std::shared_ptr<BlockOperator> M, std::shared_ptr<BlockOperator> K, std::shared_ptr<BlockVector> b,
                            Array<int> block_offsets, MPI_Comm comm)
-   : TimeDependentOperator(M.Height(), M.Width()),
+   : TimeDependentOperator(M->Height(), M->Width()),
      _z(block_offsets),
      _block_offsets(block_offsets),
      _M_solver(comm)
@@ -434,15 +474,15 @@ FE_Evolution::FE_Evolution(BlockOperator &M, BlockOperator &K, BlockVector * b,
    updateMKB(M, K, b);
 }
 
-void FE_Evolution::updateMKB(BlockOperator &M, BlockOperator &K,
-                             BlockVector * b)
+void FE_Evolution::updateMKB(std::shared_ptr<BlockOperator> M, std::shared_ptr<BlockOperator> K,
+                             std::shared_ptr<BlockVector> b)
 {
-   _M = &M;
-   _K = &K;
+   _M = M;
+   _K = K;
    _b = b;
    _M_solver.SetOperator(*_M);
 
-   _M_prec = new BlockDiagonalPreconditioner(_block_offsets);
+   _M_prec.reset(new BlockDiagonalPreconditioner(_block_offsets));
 
    _M_solver.SetPreconditioner(*_M_prec);
    _M_solver.SetRelTol(1e-9);
@@ -460,7 +500,26 @@ void FE_Evolution::Mult(const Vector &x, Vector &y) const
    _M_solver.Mult(_z, y);
 }
 
-FE_Evolution::~FE_Evolution()
+void FE_Evolution::ImplicitSolve(const real_t dt, const Vector &x, Vector &y)
 {
-   delete _M_prec;
+   // RHS of the equation: -K*x-b
+   Vector minus_x = x;
+   minus_x.Neg();
+   _K->Mult(minus_x, _z);
+   _z -= *_b;
+   SetTimeStep(dt);
+   _M_solver.Mult(_z, y);
 }
+
+void FE_Evolution::SetTimeStep(real_t dt)
+{
+   if (_dt != dt)
+   {
+      _dt = dt;
+      // Form operator A = M + dt*K
+      _A.reset(new SumOperator(_K.get(), _dt, _M.get(), 1.0, false, false));
+      // this will also call SetOperator on the preconditioner
+      _M_solver.SetOperator(*_A);
+   }
+}
+
