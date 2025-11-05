@@ -42,9 +42,11 @@ public:
    real_t _S_0n; // Particle source amplitude
 
    // System matrix and RHS
-   std::shared_ptr<BlockOperator> _M;
-   std::shared_ptr<BlockOperator> _K;
+   Array2D<const mfem::HypreParMatrix *> _h_blocks;
+   std::shared_ptr<HypreParMatrix> _M;
+   std::shared_ptr<HypreParMatrix> _K;
    std::shared_ptr<BlockVector> _B;
+   std::shared_ptr<HypreParMatrix> _M_Kdt;
    std::vector<Array<int>> _ess_tdof_lists;
 
    // Variables
@@ -70,6 +72,7 @@ private:
    void updateLFCoefs();
    void makeRadialCoefficient();
    void makeSn();
+   void DeleteAllBlocks();
 
    // FES
    std::unique_ptr<ParFiniteElementSpace> _h1_fes;
@@ -132,23 +135,22 @@ class FE_Evolution : public TimeDependentOperator
 
 public:
 
-   FE_Evolution(std::shared_ptr<BlockOperator> M, std::shared_ptr<BlockOperator> K, std::shared_ptr<BlockVector> b,
+   FE_Evolution(std::shared_ptr<HypreParMatrix> M_Kdt, std::shared_ptr<BlockVector> b,
                 Array<int> block_offsets, MPI_Comm comm);
 
-   void updateMKB(std::shared_ptr<BlockOperator> M, std::shared_ptr<BlockOperator> K, std::shared_ptr<BlockVector> b);
+   void updateMKB(std::shared_ptr<HypreParMatrix> M_Kdt, std::shared_ptr<BlockVector> b);
    void Mult(const Vector &x, Vector &y) const override;
    void ImplicitSolve(const real_t dt, const Vector &x, Vector &y) override;
    void SetTimeStep(real_t dt);
 
 private:
 
-   std::shared_ptr<BlockOperator> _M;
-   std::shared_ptr<BlockOperator> _K;
+   std::shared_ptr<HypreParMatrix> _M_Kdt;
    std::shared_ptr<BlockVector> _b;
-   std::unique_ptr<SumOperator> _A;
+   std::unique_ptr<SuperLURowLocMatrix> _SA;
    mutable BlockVector _z;
    std::unique_ptr<Solver> _M_prec;
-   CGSolver _M_solver;
+   SuperLUSolver _M_solver;
    Array<int> _block_offsets;
    real_t _dt;
 
