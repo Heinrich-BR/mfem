@@ -21,12 +21,16 @@ public:
    //   1 → T only;  omega and n stay at their initial values
    //   2 → T and omega;  n stays at its initial value
    //   3 → full T, omega, n system
-   RogersRicciNLFIntegrator(GridFunctionCoefficient &phi_gf,
+   // phi and Sn are passed as base Coefficient& so the caller can pass either
+   // a GridFunctionCoefficient (legacy path) or, preferably, a
+   // QuadratureFunctionCoefficient backed by a phi/Sn that has been projected
+   // once per stage — O(1) lookup per QP instead of a basis evaluation.
+   RogersRicciNLFIntegrator(Coefficient &phi,
                           Coefficient &Sn,
                           int num_active = NUM_VARS,
                           real_t Lambda = 3.0,
                           real_t eps2 = 1e-4)
-      : _phi_gf(&phi_gf), _Sn(&Sn),
+      : _phi(&phi), _Sn(&Sn),
         _Lambda(Lambda), _eps2(eps2),
         _num_active(num_active)
    {
@@ -55,8 +59,8 @@ public:
                             const Array2D<DenseMatrix*> &elmats) override;
 
 private:
-   GridFunctionCoefficient *_phi_gf;
-   Coefficient             *_Sn;
+   Coefficient *_phi;
+   Coefficient *_Sn;
    real_t _Lambda;
    real_t _eps2;
    int    _num_active;
@@ -150,24 +154,49 @@ private:
    void buildSpaces();
    void buildState();
    void buildCoefficients();
+   void buildQuadratureSamples();
    void buildMassMatrix();
+   void buildKForm();
+   void buildPhiSolver();
    void buildNonlinearForm();
    void setInitialConditions();
    void setOutputCollection();
 
+public:
+   // Resample phi from the H1 grid function into the quadrature-point
+   // buffer used by the reaction integrator.  Cheap (O(nelem * nQP)) and
+   // amortises the per-QP basis evaluation across every Newton iteration of
+   // the implicit stage.  Called by RicciTimeOperator::ImplicitSolve right
+   // after updatePhi().
+   void projectPhiToQuadrature();
+
+private:
+
    std::unique_ptr<ParMesh>                _pmesh;
    std::unique_ptr<ParFiniteElementSpace>  _h1_fes;
-   std::unique_ptr<ParFiniteElementSpace>  _hdiv_fes;
 
    std::vector<std::unique_ptr<ParGridFunction>> _vars;
    std::unique_ptr<ParGridFunction>              _phi;
-   std::unique_ptr<ParGridFunction>              _hdiv_gf;
    std::unique_ptr<BlockVector>                  _var_blocks;
    Array<int>                                    _block_trueOffsets;
 
    std::unique_ptr<ParBilinearForm>        _M_form;
    std::unique_ptr<HypreParMatrix>         _M_mat;
+   std::unique_ptr<ParBilinearForm>        _K_form;
    std::unique_ptr<HypreParMatrix>         _K_mat;
+
+   // Cached phi-Poisson solver.  Laplacian operator and Dirichlet BC pattern
+   // are static, so the matrix, AMG hierarchy, and CG solver are all built
+   // once in Setup and reused every implicit stage; only the RHS is rebuilt.
+   Array<int>                                    _ess_tdof_list_phi;
+   std::unique_ptr<ConstantCoefficient>          _one_phi;
+   std::unique_ptr<GridFunctionCoefficient>      _omega_coef;
+   std::unique_ptr<ProductCoefficient>           _neg_omega_coef;
+   std::unique_ptr<ParBilinearForm>              _a_phi;
+   std::unique_ptr<ParLinearForm>                _b_phi;
+   OperatorPtr                                   _A_phi;
+   std::unique_ptr<HypreBoomerAMG>               _amg_phi;
+   std::unique_ptr<CGSolver>                     _cg_phi;
 
    DenseMatrix                                          _rotmat;
    std::unique_ptr<Coefficient>                         _r;
@@ -181,6 +210,17 @@ private:
    std::unique_ptr<TransformedCoefficient>              _suw_scalar;
    std::unique_ptr<OuterProductCoefficient>             _v_E_outer;
    std::unique_ptr<ScalarMatrixProductCoefficient>      _SUW_matcoef;
+
+   // Cached quadrature samples for phi and Sn so the reaction integrator
+   // does O(1) lookups instead of a full GridFunctionCoefficient::Eval
+   // (basis + interpolation) per QP per Newton step.  Sn is geometry-only
+   // and projected once in Setup; phi is reprojected each stage after
+   // updatePhi() — see projectPhiToQuadrature().
+   std::unique_ptr<QuadratureSpace>                     _qspace;
+   std::unique_ptr<QuadratureFunction>                  _phi_qf;
+   std::unique_ptr<QuadratureFunction>                  _Sn_qf;
+   std::unique_ptr<QuadratureFunctionCoefficient>       _phi_qfc;
+   std::unique_ptr<QuadratureFunctionCoefficient>       _Sn_qfc;
 
    std::unique_ptr<ParBlockNonlinearForm>               _F_form;
 
@@ -211,7 +251,10 @@ public:
    explicit RicciImplicitStageOp(Ricci2DNonlinear &ricci);
 
    // Cache the parameters for the current implicit stage.  RicciTimeOperator
-   // calls this from inside ImplicitSolve before invoking NewtonSolver.
+   // calls this from inside ImplicitSolve before invoking NewtonSolver.  We
+   // pre-compute M + gamma*K here (constant for the whole stage) so that the
+   // per-Newton GetGradient call only has to add in the small reaction
+   // contributions.
    void SetParameters(real_t gamma, const BlockVector &u_pred);
 
    void Mult(const Vector &k, Vector &R) const override;
@@ -225,7 +268,17 @@ private:
    // Workspace
    mutable BlockVector              _z;
    mutable Vector                   _tmp_block;
-   mutable std::unique_ptr<HypreParMatrix> _Jac;
+
+   // Persistent block Jacobian.  We never materialise the monolithic
+   // HypreParMatrix; the linear solver (GMRES + block-diag AMG) operates
+   // directly on the block form, so each Newton iter only has to rebuild
+   // the diagonal reaction additions and the two off-diagonal F' blocks.
+   mutable BlockOperator                   _Jac_block;
+   mutable std::unique_ptr<HypreParMatrix> _M_plus_gK; // built per stage
+   mutable std::unique_ptr<HypreParMatrix> _diag_T;    // built per Newton iter
+   mutable std::unique_ptr<HypreParMatrix> _diag_n;    // (n_active >= 3)
+   mutable std::unique_ptr<HypreParMatrix> _gFwT;      // (n_active >= 2)
+   mutable std::unique_ptr<HypreParMatrix> _gFnT;      // (n_active >= 3)
 };
 
 // ---------------------------------------------------------------------------
@@ -242,7 +295,9 @@ class RicciTimeOperator : public TimeDependentOperator
 {
 public:
    RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear &ricci,
-                     real_t newton_rtol = 1e-8, int newton_max_iter = 15);
+                     real_t newton_rtol = 1e-8, int newton_max_iter = 15,
+                     real_t lin_rtol = 1e-10, int lin_max_iter = 200,
+                     int kdim = 50);
 
    // Explicit RHS is not supported — only DIRK-family solvers via ImplicitSolve.
    void Mult(const Vector&, Vector&) const override
@@ -252,13 +307,21 @@ public:
 
    void ImplicitSolve(real_t gamma, const Vector &u_pred, Vector &k) override;
 
+   // Turn on Eisenstat-Walker forcing so the inner Krylov tolerance loosens
+   // when Newton is far from convergence.  Useful when Newton typically takes
+   // many iterations per stage; usually unhelpful when it converges in 1-2.
+   void EnableEisenstatWalker(real_t rtol0 = 0.5, real_t rtol_max = 0.9);
+
 private:
-   Ricci2DNonlinear         &_ricci;
-   RicciImplicitStageOp      _stage_op;
-   std::unique_ptr<NewtonSolver> _newton;  // BacktrackingNewtonSolver internally;
-                                            // type-erased so the header stays
-                                            // free of the line-search subclass
-   std::unique_ptr<Solver>   _lin_solver;   // wraps SuperLU; same reason
+   Ricci2DNonlinear              &_ricci;
+   RicciImplicitStageOp           _stage_op;
+   std::unique_ptr<NewtonSolver>  _newton;       // BacktrackingNewtonSolver
+                                                  // internally; type-erased so
+                                                  // the header stays free of
+                                                  // the line-search subclass
+   std::unique_ptr<IterativeSolver> _lin_solver; // BlockNewtonLinearSolver
+                                                  // internally (GMRES + block-
+                                                  // diag AMG); same reason
 };
 
 #endif // MFEM_EX42P_HPP

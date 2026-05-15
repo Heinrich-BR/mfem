@@ -38,7 +38,7 @@ void RogersRicciNLFIntegrator::AssembleElementVector(
       const real_t T = shape * (*elfun[T_IDX]);
       const real_t n = shape * (*elfun[N_IDX]);
 
-      const real_t phi = _phi_gf->Eval(Tr, ip);
+      const real_t phi = _phi->Eval(Tr, ip);
       const real_t Sn  = _Sn->Eval(Tr, ip);
 
       // Regularisation: replace 1/T by 1/Treg with Treg = sqrt(T^2 + eps2).
@@ -96,7 +96,7 @@ void RogersRicciNLFIntegrator::AssembleElementGrad(
       const real_t T = shape * (*elfun[T_IDX]);
       const real_t n = shape * (*elfun[N_IDX]);
 
-      const real_t phi  = _phi_gf->Eval(Tr, ip);
+      const real_t phi  = _phi->Eval(Tr, ip);
       const real_t Treg = std::sqrt(T*T + _eps2);
       const real_t A    = _Lambda - phi / Treg;
       const real_t eA   = std::exp(A);
@@ -151,11 +151,30 @@ void Ricci2DNonlinear::Setup()
    buildSpaces();
    buildState();
    buildCoefficients();
+   buildQuadratureSamples();
    buildMassMatrix();
    setInitialConditions();
    syncBlocksFromGridFuncs(*_var_blocks);
+
+   // Sn is geometry-only — project it into its quadrature-function buffer
+   // once and the integrator will look it up with O(1) cost forever after.
+   _Sn->Project(*_Sn_qf);
+
+   // phi starts uniform (constant 0.03) — seed the quadrature sample so the
+   // first F_form action sees the initial condition, not zeros.
+   projectPhiToQuadrature();
+
    buildNonlinearForm();
    setOutputCollection();
+
+   // Build the phi-Poisson solver once: the Laplacian operator and the
+   // boundary topology don't change with time, so we can amortise the AMG
+   // setup across every implicit stage.
+   buildPhiSolver();
+
+   // Build the K (advection + SUW) bilinear form once with the integrators
+   // wired to live coefficients; reassembleK() will Update/Assemble in place.
+   buildKForm();
 
    // Initial K with zero v_d (phi is uniform → grad phi = 0).
    refreshDriftCoefs();
@@ -177,8 +196,6 @@ void Ricci2DNonlinear::buildSpaces()
 {
    _h1_fes = std::make_unique<ParFiniteElementSpace>(
                 _pmesh.get(), new H1_FECollection(_order, _dim));
-   _hdiv_fes = std::make_unique<ParFiniteElementSpace>(
-                  _pmesh.get(), new RT_FECollection(_order, _dim));
 }
 
 void Ricci2DNonlinear::buildState()
@@ -188,8 +205,7 @@ void Ricci2DNonlinear::buildState()
    {
       _vars[i] = std::make_unique<ParGridFunction>(_h1_fes.get());
    }
-   _phi     = std::make_unique<ParGridFunction>(_h1_fes.get());
-   _hdiv_gf = std::make_unique<ParGridFunction>(_hdiv_fes.get());
+   _phi = std::make_unique<ParGridFunction>(_h1_fes.get());
 
    _block_trueOffsets.SetSize(NUM_VARS + 1);
    _block_trueOffsets[0] = 0;
@@ -257,6 +273,24 @@ void Ricci2DNonlinear::buildCoefficients()
                      *_suw_scalar, *_v_E_outer);
 }
 
+void Ricci2DNonlinear::buildQuadratureSamples()
+{
+   // Same order as RogersRicciNLFIntegrator's integration rule (2p+3), so
+   // QuadratureFunctionCoefficient::Eval indexes into the same point set
+   // the integrator iterates over.
+   const int qorder = 2 * _order + 3;
+   _qspace  = std::make_unique<QuadratureSpace>(_pmesh.get(), qorder);
+   _phi_qf  = std::make_unique<QuadratureFunction>(*_qspace);
+   _Sn_qf   = std::make_unique<QuadratureFunction>(*_qspace);
+   _phi_qfc = std::make_unique<QuadratureFunctionCoefficient>(*_phi_qf);
+   _Sn_qfc  = std::make_unique<QuadratureFunctionCoefficient>(*_Sn_qf);
+}
+
+void Ricci2DNonlinear::projectPhiToQuadrature()
+{
+   _phi_qf->ProjectGridFunction(*_phi);
+}
+
 void Ricci2DNonlinear::buildMassMatrix()
 {
    _M_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
@@ -266,6 +300,65 @@ void Ricci2DNonlinear::buildMassMatrix()
    _M_mat.reset(_M_form->ParallelAssemble());
 }
 
+void Ricci2DNonlinear::buildKForm()
+{
+   // K = -(1/B) (v_d · grad u, v) + (c v_E ⊗ v_E : grad u ⊗ grad v).
+   // The integrators reference the live coefficients owned by Ricci2DNonlinear,
+   // so updates to phi (and hence v_d, v_E) flow through to the next Assemble
+   // without rewiring.
+   _K_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
+   _K_form->AddDomainIntegrator(new ConvectionIntegrator(*_vd, -_Binv));
+   _K_form->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef));
+}
+
+void Ricci2DNonlinear::buildPhiSolver()
+{
+   // Essential dofs: Dirichlet on every boundary attribute (values held at
+   // whatever _phi was set to in setInitialConditions, i.e. the constant
+   // 0.03 used as the symmetry-breaking inlet potential).
+   Array<int> ess_bdr(_pmesh->bdr_attributes.Max());
+   ess_bdr = 1;
+   _h1_fes->GetEssentialTrueDofs(ess_bdr, _ess_tdof_list_phi);
+
+   // Bilinear form: ∇·∇  (assembled once; the operator is static).
+   _one_phi = std::make_unique<ConstantCoefficient>(1.0);
+   _a_phi   = std::make_unique<ParBilinearForm>(_h1_fes.get());
+   _a_phi->AddDomainIntegrator(new DiffusionIntegrator(*_one_phi));
+   _a_phi->Assemble();
+   _a_phi->Finalize();
+
+   // Long-lived linear form: omega coefficient is a live view into the
+   // _vars[OMEGA_IDX] grid function, so re-Assembling each stage picks up
+   // the latest predictor state.
+   _omega_coef     = std::make_unique<GridFunctionCoefficient>(
+                        _vars[OMEGA_IDX].get());
+   _neg_omega_coef = std::make_unique<ProductCoefficient>(-1.0, *_omega_coef);
+   _b_phi          = std::make_unique<ParLinearForm>(_h1_fes.get());
+   _b_phi->AddDomainIntegrator(new DomainLFIntegrator(*_neg_omega_coef));
+
+   // Trigger the BC-elimination path once so _A_phi points to the
+   // already-eliminated p_mat.  Subsequent FormLinearSystem calls in
+   // updatePhi will reuse this matrix (see ParBilinearForm::FormSystemMatrix
+   // — after the first call, `mat` is NULL and only the BC application on B
+   // is repeated, with no re-assembly cost).
+   _b_phi->Assemble();
+   Vector X_tmp, B_tmp;
+   _a_phi->FormLinearSystem(_ess_tdof_list_phi, *_phi, *_b_phi,
+                            _A_phi, X_tmp, B_tmp);
+
+   // AMG hierarchy built once against the eliminated parallel matrix.
+   _amg_phi = std::make_unique<HypreBoomerAMG>();
+   _amg_phi->SetPrintLevel(0);
+   _amg_phi->SetOperator(*_A_phi);
+
+   _cg_phi = std::make_unique<CGSolver>(_comm);
+   _cg_phi->SetRelTol(1e-12);
+   _cg_phi->SetMaxIter(2000);
+   _cg_phi->SetPrintLevel(0);
+   _cg_phi->SetPreconditioner(*_amg_phi);
+   _cg_phi->SetOperator(*_A_phi);
+}
+
 void Ricci2DNonlinear::buildNonlinearForm()
 {
    Array<ParFiniteElementSpace*> fes(NUM_VARS);
@@ -273,7 +366,7 @@ void Ricci2DNonlinear::buildNonlinearForm()
 
    _F_form = std::make_unique<ParBlockNonlinearForm>(fes);
    _F_form->AddDomainIntegrator(
-      new RogersRicciNLFIntegrator(*_phi_gfcoef, *_Sn, _num_active,
+      new RogersRicciNLFIntegrator(*_phi_qfc, *_Sn_qfc, _num_active,
                                  _Lambda, _eps2));
 }
 
@@ -287,7 +380,7 @@ void Ricci2DNonlinear::setInitialConditions()
 
 void Ricci2DNonlinear::setOutputCollection()
 {
-   _dc = std::make_unique<ParaViewDataCollection>("Ricci2DNonlinear/Step",
+   _dc = std::make_unique<ParaViewDataCollection>("Ricci2DNonlinearOpt/Step",
                                                   _pmesh.get());
    _dc->RegisterField("phi",   _phi.get());
    _dc->RegisterField("T",     _vars[T_IDX].get());
@@ -318,38 +411,21 @@ void Ricci2DNonlinear::pullOmegaFromBlocks(const BlockVector &u_blk)
 
 void Ricci2DNonlinear::updatePhi()
 {
-   // Dirichlet on all boundary attributes: keeps the current _phi boundary
-   // values (initialised to 0.03 in setInitialConditions and preserved here).
-   Array<int> ess_tdof_list,
-              ess_bdr(_pmesh->bdr_attributes.Max());
-   ess_bdr = 1;
-   _h1_fes->GetEssentialTrueDofs(ess_bdr, ess_tdof_list);
+   // RHS is the only thing that changes between stages: the omega coefficient
+   // is a live view into _vars[OMEGA_IDX] (refreshed by pullOmegaFromBlocks
+   // just before this call), so re-Assembling _b_phi picks up the predictor.
+   _b_phi->Assemble();
 
-   ParBilinearForm a(_h1_fes.get());
-   ConstantCoefficient one(1.0);
-   a.AddDomainIntegrator(new DiffusionIntegrator(one));
-   a.Assemble();
-
-   // RHS: solve  a phi = -(omega, v)   =>   ∇²phi = omega.
-   ParLinearForm b(_h1_fes.get());
-   GridFunctionCoefficient omega_coef(_vars[OMEGA_IDX].get());
-   ProductCoefficient      neg_omega_coef(-1.0, omega_coef);
-   b.AddDomainIntegrator(new DomainLFIntegrator(neg_omega_coef));
-   b.Assemble();
-
+   // FormLinearSystem after the first call returns the same eliminated p_mat
+   // (no re-assembly), applies BC adjustment to B, and packs X with current
+   // _phi true-dof values.  The cached AMG and CG operators were bound to
+   // this same matrix in buildPhiSolver().
    OperatorPtr A;
    Vector X, B;
-   a.FormLinearSystem(ess_tdof_list, *_phi, b, A, X, B);
+   _a_phi->FormLinearSystem(_ess_tdof_list_phi, *_phi, *_b_phi, A, X, B);
 
-   HypreBoomerAMG prec;
-   CGSolver cg(_comm);
-   cg.SetRelTol(1e-12);
-   cg.SetMaxIter(2000);
-   cg.SetPrintLevel(0);
-   cg.SetPreconditioner(prec);
-   cg.SetOperator(*A);
-   cg.Mult(B, X);
-   a.RecoverFEMSolution(X, b, *_phi);
+   _cg_phi->Mult(B, X);
+   _a_phi->RecoverFEMSolution(X, *_b_phi, *_phi);
 }
 
 void Ricci2DNonlinear::refreshDriftCoefs()
@@ -363,13 +439,14 @@ void Ricci2DNonlinear::refreshDriftCoefs()
 
 void Ricci2DNonlinear::reassembleK()
 {
-   ParBilinearForm k_form(_h1_fes.get());
-   k_form.AddDomainIntegrator(new ConvectionIntegrator(*_vd, -_Binv));
-   k_form.AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef));
-   k_form.Assemble();
-   k_form.Finalize();
-
-   _K_mat.reset(k_form.ParallelAssemble());
+   // Update() drops the previous SparseMatrix and the eliminated parallel
+   // matrix without touching the attached integrators or coefficients, so
+   // the next Assemble re-uses the same integrator chain and just picks up
+   // the new v_d / v_E values that depend on the freshly-updated phi.
+   _K_form->Update();
+   _K_form->Assemble();
+   _K_form->Finalize();
+   _K_mat.reset(_K_form->ParallelAssemble());
 }
 
 void Ricci2DNonlinear::updateDataCollection(int step, real_t t)
@@ -389,13 +466,27 @@ RicciImplicitStageOp::RicciImplicitStageOp(Ricci2DNonlinear &ricci)
      _gamma(0.0),
      _u_pred(nullptr),
      _z(ricci.BlockTrueOffsets()),
-     _tmp_block(ricci.H1FES()->GetTrueVSize())
-{ }
+     _tmp_block(ricci.H1FES()->GetTrueVSize()),
+     _Jac_block(ricci.BlockTrueOffsets())
+{
+   // Workspace vectors participate in HypreParMatrix SpMV operations that go
+   // to device when Hypre is built with GPU support; mark them so the memory
+   // class follows the active Device().
+   _z.UseDevice(true);
+   _tmp_block.UseDevice(true);
+}
 
 void RicciImplicitStageOp::SetParameters(real_t gamma, const BlockVector &u_pred)
 {
    _gamma = gamma;
    _u_pred = &u_pred;
+
+   // The M + gamma*K block is shared across every Newton iter of this stage
+   // and across every variable row.  Build it once here so GetGradient only
+   // has to fold in the reaction contribution F'_ss.
+   HypreParMatrix *M = _ricci.MassMat();
+   HypreParMatrix *K = _ricci.KMat();
+   _M_plus_gK.reset(Add(1.0, *M, _gamma, *K));
 }
 
 void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
@@ -436,12 +527,9 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
    // z = u_pred + gamma * k.
    add(*_u_pred, _gamma, k_vec, _z);
 
-   // F's 3x3 block gradient at z.  Non-zero blocks (when fully active) are:
-   //   diagonal: (T,T), (n,n)        — at omega, ∂F_ω/∂ω = 0 anyway.
-   //   off-diag: (omega,T), (n,T)    — F_ω and F_n depend on T.
-   // The integrator gates these on num_active so any block destined for a
-   // frozen row stays as a zero HypreParMatrix and is simply not referenced
-   // here.
+   // F's 3x3 block gradient at z.  The integrator gates this on num_active
+   // — frozen rows produce no contribution.  Non-zero blocks (fully active)
+   // are (T,T), (omega,T), (n,T), (n,n).
    BlockOperator &Fgrad = _ricci.FForm()->GetGradient(_z);
    auto Fblock = [&](int i, int j) -> HypreParMatrix &
    {
@@ -450,58 +538,44 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
 
    const int       n_active = _ricci.NumActive();
    HypreParMatrix *M = _ricci.MassMat();
-   HypreParMatrix *K = _ricci.KMat();
 
-   // Collect temporaries so they free automatically.
-   std::vector<std::unique_ptr<HypreParMatrix>> owned;
-   auto own = [&](HypreParMatrix *p) -> HypreParMatrix*
+   // T row is always active.  M + gamma*K is precomputed in SetParameters.
+   _diag_T.reset(Add(1.0, *_M_plus_gK, _gamma, Fblock(T_IDX, T_IDX)));
+   _Jac_block.SetDiagonalBlock(T_IDX, _diag_T.get());
+
+   // omega row: M + gamma*K if active (F'_omega,omega = 0), bare M if frozen
+   // so Newton drives k_omega to 0.
+   _Jac_block.SetDiagonalBlock(OMEGA_IDX,
+                               (n_active >= 2) ? _M_plus_gK.get() : M);
+
+   // n row: M + gamma*K + gamma*F'_{n,n} if active, bare M if frozen.
+   if (n_active >= 3)
    {
-      owned.emplace_back(p);
-      return p;
-   };
-
-   // For ACTIVE rows the diagonal is M + gamma*K + gamma*F'_ss; for FROZEN
-   // rows we want Newton to drive k_s to 0, which is exactly the equation
-   // M*k_s = 0 → frozen-row diagonal is just M and there are no off-diag
-   // couplings into that row.
-   //
-   // Note: T is always active (num_active >= 1 by construction).  We share
-   // a single `common = M + gamma*K` block across all active rows.
-   HypreParMatrix *common = own(Add(1.0, *M, _gamma, *K));
-
-   HypreParMatrix *diag_T = own(Add(1.0, *common, _gamma,
-                                    Fblock(T_IDX, T_IDX)));
-   HypreParMatrix *diag_omega = (n_active >= 2) ? common : M;   // F'_ωω = 0
-   HypreParMatrix *diag_n     = (n_active >= 3)
-                                ? own(Add(1.0, *common, _gamma,
-                                          Fblock(N_IDX, N_IDX)))
-                                : M;
-
-   // Off-diagonals.  Add(0, X, gamma, X) yields a fresh gamma*X.
-   HypreParMatrix *gFwT = (n_active >= 2)
-                          ? own(Add(0.0, Fblock(OMEGA_IDX, T_IDX),
-                                    _gamma, Fblock(OMEGA_IDX, T_IDX)))
-                          : nullptr;
-   HypreParMatrix *gFnT = (n_active >= 3)
-                          ? own(Add(0.0, Fblock(N_IDX, T_IDX),
-                                    _gamma, Fblock(N_IDX, T_IDX)))
-                          : nullptr;
-
-   // Stitch into the monolithic 3x3 Jacobian.
-   Array2D<const HypreParMatrix*> blocks(NUM_VARS, NUM_VARS);
-   for (int i = 0; i < NUM_VARS; ++i)
-   {
-      for (int j = 0; j < NUM_VARS; ++j) { blocks(i, j) = nullptr; }
+      _diag_n.reset(Add(1.0, *_M_plus_gK, _gamma, Fblock(N_IDX, N_IDX)));
+      _Jac_block.SetDiagonalBlock(N_IDX, _diag_n.get());
    }
-   blocks(T_IDX,     T_IDX)     = diag_T;
-   blocks(OMEGA_IDX, OMEGA_IDX) = diag_omega;
-   blocks(N_IDX,     N_IDX)     = diag_n;
-   if (gFwT) { blocks(OMEGA_IDX, T_IDX) = gFwT; }
-   if (gFnT) { blocks(N_IDX,     T_IDX) = gFnT; }
+   else
+   {
+      _diag_n.reset();
+      _Jac_block.SetDiagonalBlock(N_IDX, M);
+   }
 
-   _Jac.reset(HypreParMatrixFromBlocks(blocks));
-   // `owned` destructs here, freeing the temporaries we allocated.
-   return *_Jac;
+   // Off-diagonals: gamma * F'_{omega,T} and gamma * F'_{n,T}.
+   // Add(0, X, gamma, X) yields a fresh gamma*X HypreParMatrix.
+   if (n_active >= 2)
+   {
+      _gFwT.reset(Add(0.0, Fblock(OMEGA_IDX, T_IDX),
+                      _gamma, Fblock(OMEGA_IDX, T_IDX)));
+      _Jac_block.SetBlock(OMEGA_IDX, T_IDX, _gFwT.get());
+   }
+   if (n_active >= 3)
+   {
+      _gFnT.reset(Add(0.0, Fblock(N_IDX, T_IDX),
+                      _gamma, Fblock(N_IDX, T_IDX)));
+      _Jac_block.SetBlock(N_IDX, T_IDX, _gFnT.get());
+   }
+
+   return _Jac_block;
 }
 
 // ===========================================================================
@@ -552,43 +626,110 @@ public:
    }
 };
 
-// Adapter that turns the standard Solver/SetOperator(Operator&) pattern that
-// NewtonSolver uses into the SuperLU-specific path: each fresh Jacobian
-// HypreParMatrix is re-wrapped in a SuperLURowLocMatrix and re-factored.
-class SuperLUDirectSolver : public Solver
+// Block-aware Krylov solver consumed by NewtonSolver as its linear solver.
+//
+// NewtonSolver hands us the Jacobian via SetOperator(op) and expects us to
+// solve J s = r on Mult(r, s).  We:
+//   - cast the operator down to BlockOperator (built by RicciImplicitStageOp),
+//   - extract its three diagonal HypreParMatrix blocks,
+//   - rebuild the per-variable AMG hierarchies that sit on the diagonal of a
+//     BlockDiagonalPreconditioner, and
+//   - call GMRES with the BlockOperator as the system operator and the
+//     block-diag preconditioner.
+//
+// Inherits from IterativeSolver so that NewtonSolver::SetAdaptiveLinRtol
+// (Eisenstat-Walker forcing) can call our SetRelTol — we override Mult to
+// forward the inherited rel_tol/abs_tol/max_iter to the internal GMRES.
+class BlockNewtonLinearSolver : public IterativeSolver
 {
 public:
-   explicit SuperLUDirectSolver(MPI_Comm comm)
-      : Solver(0, false), _solver(comm) {}
+   BlockNewtonLinearSolver(MPI_Comm comm,
+                           real_t rtol = 1e-10,
+                           int max_it = 200,
+                           int kdim = 50)
+      : IterativeSolver(comm),
+        _gmres(comm)
+   {
+      SetRelTol(rtol);
+      SetAbsTol(0.0);
+      SetMaxIter(max_it);
+      _gmres.SetKDim(kdim);
+      _gmres.SetPrintLevel(0);
+      _amgs.resize(NUM_VARS);
+      for (int s = 0; s < NUM_VARS; ++s)
+      {
+         _amgs[s] = std::make_unique<HypreBoomerAMG>();
+         _amgs[s]->SetPrintLevel(0);
+      }
+   }
 
    void SetOperator(const Operator &op) override
    {
-      const HypreParMatrix *A = dynamic_cast<const HypreParMatrix*>(&op);
-      MFEM_VERIFY(A != nullptr,
-                  "SuperLUDirectSolver expects a HypreParMatrix operator.");
-      _SA.reset(new SuperLURowLocMatrix(*A));
-      _solver.SetOperator(*_SA);
-      height = op.Height();
-      width  = op.Width();
+      const BlockOperator *bop = dynamic_cast<const BlockOperator*>(&op);
+      MFEM_VERIFY(bop != nullptr,
+                  "BlockNewtonLinearSolver: expected a BlockOperator from "
+                  "RicciImplicitStageOp::GetGradient().");
+
+      // (Re)build each AMG on the matching diagonal HypreParMatrix first, so
+      // its height/width are valid before the block-diag preconditioner runs
+      // its dimension check in SetDiagonalBlock.  GetBlock is non-const on
+      // BlockOperator, so cast away const — we don't mutate.
+      BlockOperator &bopnc = const_cast<BlockOperator&>(*bop);
+      for (int s = 0; s < NUM_VARS; ++s)
+      {
+         HypreParMatrix &diag = dynamic_cast<HypreParMatrix&>(
+                                   bopnc.GetBlock(s, s));
+         _amgs[s]->SetOperator(diag);
+      }
+
+      // Build the BDP lazily so we don't need the offsets in the ctor.
+      // The AMG pointers remain valid across Newton iters, so a single BDP
+      // suffices for the whole stage (and run).
+      if (!_bdp)
+      {
+         _bdp = std::make_unique<BlockDiagonalPreconditioner>(bop->RowOffsets());
+         for (int s = 0; s < NUM_VARS; ++s)
+         {
+            _bdp->SetDiagonalBlock(s, _amgs[s].get());
+         }
+         _gmres.SetPreconditioner(*_bdp);
+      }
+
+      _gmres.SetOperator(*bop);
+      height = bop->Height();
+      width  = bop->Width();
    }
 
-   void Mult(const Vector &b, Vector &x) const override { _solver.Mult(b, x); }
+   void Mult(const Vector &b, Vector &x) const override
+   {
+      // Propagate any Eisenstat-Walker rtol set by NewtonSolver since the
+      // last call.  rel_tol / max_iter live on the IterativeSolver base; the
+      // internal GMRES has its own copies.
+      _gmres.SetRelTol(rel_tol);
+      _gmres.SetAbsTol(abs_tol);
+      _gmres.SetMaxIter(max_iter);
+      _gmres.Mult(b, x);
+   }
 
 private:
-   mutable SuperLUSolver                _solver;
-   std::unique_ptr<SuperLURowLocMatrix> _SA;
+   mutable GMRESSolver                          _gmres;
+   std::unique_ptr<BlockDiagonalPreconditioner> _bdp;
+   std::vector<std::unique_ptr<HypreBoomerAMG>> _amgs;
 };
 } // anonymous namespace
 
 RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear &ricci,
-                                     real_t newton_rtol, int newton_max_iter)
+                                     real_t newton_rtol, int newton_max_iter,
+                                     real_t lin_rtol, int lin_max_iter,
+                                     int kdim)
    : TimeDependentOperator(ricci.BlockTrueOffsets().Last(),
                            /*t=*/0.0,
                            TimeDependentOperator::IMPLICIT),
      _ricci(ricci),
      _stage_op(ricci),
      _newton(new BacktrackingNewtonSolver(comm)),
-     _lin_solver(new SuperLUDirectSolver(comm))
+     _lin_solver(new BlockNewtonLinearSolver(comm, lin_rtol,
+                                             lin_max_iter, kdim))
 {
    _newton->iterative_mode = false;       // initial guess for k is zero
    _newton->SetSolver(*_lin_solver);
@@ -597,6 +738,16 @@ RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear &ricci,
    _newton->SetAbsTol(0.0);
    _newton->SetMaxIter(newton_max_iter);
    _newton->SetPrintLevel(1);             // print Newton iterations per stage
+
+   // Eisenstat-Walker forcing is opt-in via EnableEisenstatWalker() (CLI: -ew).
+   // In this regime Newton usually converges in 1-2 iters per stage, so a
+   // tight fixed linear rtol (the default constructed above) is typically the
+   // right choice; EW pays off mostly when Newton chains get long.
+}
+
+void RicciTimeOperator::EnableEisenstatWalker(real_t rtol0, real_t rtol_max)
+{
+   _newton->SetAdaptiveLinRtol(/*type=*/2, rtol0, rtol_max);
 }
 
 void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
@@ -609,11 +760,13 @@ void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
                           _ricci.BlockTrueOffsets());
 
    // (1) omega-from-predictor → (2) phi from Poisson → (3) refresh drift →
-   // (4) re-assemble K with the new vd.
+   // (4) re-assemble K with the new vd → (5) resample phi at quadrature
+   // points for the reaction integrator's hot loop.
    _ricci.pullOmegaFromBlocks(u_pred_blk);
    _ricci.updatePhi();
    _ricci.refreshDriftCoefs();
    _ricci.reassembleK();
+   _ricci.projectPhiToQuadrature();
 
    // (5) Wire up the stage equation R(k) = M k + K(u + γk) + F(u + γk).
    _stage_op.SetParameters(gamma, u_pred_blk);
@@ -632,10 +785,12 @@ int main(int argc, char *argv[])
    Mpi::Init(argc, argv);
    const int myid = Mpi::WorldRank();
    Hypre::Init();
-   Device device("cpu");
-   if (myid == 0) { device.Print(); }
 
    // ---- options ----------------------------------------------------------
+   const char *device_config = "cpu";   // "cuda", "hip", "occa-cpu", ...
+                                        // (requires MFEM/HYPRE built with the
+                                        //  matching backend; on GPU also
+                                        //  needs HYPRE_USING_GPU).
    int    order             = 1;
    int    ser_ref_levels    = 0;
    int    par_ref_levels    = 0;
@@ -646,10 +801,19 @@ int main(int argc, char *argv[])
    real_t dt                = 2.4e-3;
    real_t newton_rtol       = 1e-8;
    int    newton_max_iter   = 15;
+   real_t lin_rtol          = 1e-10;
+   int    lin_max_iter      = 200;
+   int    kdim              = 50;
+   bool   enable_ew         = false;
+   real_t ew_rtol0          = 0.5;
+   real_t ew_rtol_max       = 0.9;
    int    num_active        = NUM_VARS;
    int    vis_steps         = 1;
 
    OptionsParser args(argc, argv);
+   args.AddOption(&device_config, "-d", "--device",
+                  "Device configuration string, see Device::Configure() "
+                  "(e.g. 'cpu', 'cuda', 'hip').");
    args.AddOption(&order, "-o", "--order",
                   "Polynomial degree of the H1 finite element space.");
    args.AddOption(&ser_ref_levels, "-rs", "--refine-serial",
@@ -666,6 +830,19 @@ int main(int argc, char *argv[])
                   "Relative tolerance for the Newton solver.");
    args.AddOption(&newton_max_iter, "-nmax", "--newton-max-iter",
                   "Maximum Newton iterations per implicit stage.");
+   args.AddOption(&lin_rtol, "-ltol", "--lin-rtol",
+                  "Relative tolerance for the inner GMRES.");
+   args.AddOption(&lin_max_iter, "-lmax", "--lin-max-iter",
+                  "Maximum GMRES iterations per Newton step.");
+   args.AddOption(&kdim, "-kdim", "--krylov-dim",
+                  "Krylov subspace dimension for GMRES.");
+   args.AddOption(&enable_ew, "-ew", "--eisenstat-walker",
+                  "-no-ew", "--no-eisenstat-walker",
+                  "Enable Eisenstat-Walker adaptive linear tolerance.");
+   args.AddOption(&ew_rtol0, "-ew-rtol0", "--ew-rtol-initial",
+                  "Initial Eisenstat-Walker rtol.");
+   args.AddOption(&ew_rtol_max, "-ew-rtol-max", "--ew-rtol-max",
+                  "Maximum (loosest) Eisenstat-Walker rtol.");
    args.AddOption(&num_active, "-nv", "--num-vars",
                   "How many variables to evolve in time: 1 = T only, "
                   "2 = T and omega, 3 = T, omega, and n (full system).");
@@ -678,6 +855,12 @@ int main(int argc, char *argv[])
       return 1;
    }
    if (myid == 0) { args.PrintOptions(std::cout); }
+
+   // Configure the Device AFTER parsing so -d cuda/hip can be honoured.
+   // Done before any FE space / vector allocation so memory classes are set
+   // correctly on construction.
+   Device device(device_config);
+   if (myid == 0) { device.Print(); }
 
    Ricci2DNonlinear ricci(MPI_COMM_WORLD, order, ser_ref_levels, xL, yL,
                           num_active);
@@ -701,7 +884,10 @@ int main(int argc, char *argv[])
    }
 
    RicciTimeOperator time_op(MPI_COMM_WORLD, ricci,
-                             newton_rtol, newton_max_iter);
+                             newton_rtol, newton_max_iter,
+                             lin_rtol, lin_max_iter, kdim);
+   if (enable_ew) { time_op.EnableEisenstatWalker(ew_rtol0, ew_rtol_max); }
+
    std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(ode_solver_type);
    ode_solver->Init(time_op);
 

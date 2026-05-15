@@ -1,8 +1,19 @@
 #include "mfem.hpp"
 #include <fstream>
 #include <iostream>
+#include <vector>
 
 using namespace mfem;
+
+enum VarIdx : int { T_IDX = 0, OMEGA_IDX = 1, N_IDX = 2 };
+
+// Number of variables actually evolved in time. Set at compile time:
+//   1 → only T (ω and n stay at their initial values; ϕ stays uniform)
+//   2 → T and ω (n stays at its initial value)
+//   3 → full T, ω, n system
+// Variables with index >= NUM_VARS are not allocated; access to them is
+// guarded throughout the code by `IDX < NUM_VARS` checks.
+constexpr int NUM_VARS = 2;
 
 class Ricci2D
 {
@@ -49,10 +60,8 @@ public:
    std::shared_ptr<HypreParMatrix> _M_Kdt;
    std::vector<Array<int>> _ess_tdof_lists;
 
-   // Variables
-   std::unique_ptr<ParGridFunction> _n;
-   std::unique_ptr<ParGridFunction> _T;
-   std::unique_ptr<ParGridFunction> _omega;
+   // Variables — _vars indexed by VarIdx (T, ω, n) to match the PDF derivation.
+   std::vector<std::unique_ptr<ParGridFunction>> _vars;
    std::unique_ptr<ParGridFunction> _phi;
    
    std::unique_ptr<BlockVector> _var_blocks;
@@ -73,6 +82,7 @@ private:
    void makeRadialCoefficient();
    void makeSn();
    void DeleteAllBlocks();
+   void ClearAllBlocks();
 
    // FES
    std::unique_ptr<ParFiniteElementSpace> _h1_fes;
@@ -96,9 +106,8 @@ private:
    std::unique_ptr<ParGridFunction> _r_test_gf;
    ////////////////////////////////////////////////////////////
 
-   std::unique_ptr<GridFunctionCoefficient> _n_gfcoef;
-   std::unique_ptr<GridFunctionCoefficient> _T_gfcoef;
-   std::unique_ptr<GridFunctionCoefficient> _omega_gfcoef;
+   // GridFunctionCoefficients for the time-evolved variables, indexed by VarIdx.
+   std::vector<std::unique_ptr<GridFunctionCoefficient>> _var_gfcoefs;
    std::unique_ptr<GridFunctionCoefficient> _phi_gfcoef;
 
    // Coefficients for the Gateaux derivatives in the BLFs
@@ -107,9 +116,8 @@ private:
    std::unique_ptr<Coefficient> _DTFT;
    std::unique_ptr<Coefficient> _DTFw;
 
-   std::unique_ptr<TransformedCoefficient> _Fn;
-   std::unique_ptr<TransformedCoefficient> _FT;
-   std::unique_ptr<TransformedCoefficient> _Fw;
+   // Source-term coefficients F_x indexed by VarIdx.
+   std::vector<std::unique_ptr<Coefficient>> _F;
 
    std::unique_ptr<TransformedCoefficient> _thermal_exp;
    std::unique_ptr<TransformedCoefficient> _Fn_no_source;
