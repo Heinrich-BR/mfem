@@ -2,10 +2,7 @@
 #define MFEM_EX42P_HPP
 
 #include "mfem.hpp"
-
-#include <memory>
-#include <string>
-#include <vector>
+#include <filesystem>
 
 using namespace mfem;
 
@@ -81,6 +78,7 @@ private:
 class Ricci2DNonlinear
 {
 public:
+
    // num_active = 1, 2, or 3 picks how many of (T, omega, n) are time-evolved.
    //   1 → T only (omega, n frozen at their initial values; phi stays uniform)
    //   2 → T and omega (n frozen)
@@ -93,14 +91,43 @@ public:
    // = 40 are all expressed in these units, so do not change xL/yL unless
    // you also rescale those constants).
    Ricci2DNonlinear(MPI_Comm comm,
-                    int order = 1, int ref_levels = 0,
-                    real_t xL = 100.0, real_t yL = 100.0,
-                    int num_active = NUM_VARS);
+                    int order, int ref_levels,
+                    real_t xL, real_t yL,
+                    int num_active,
+                    const std::string &save_dir);
+
+   // Path layout, derived from `save_dir`:
+   //   <save_dir>/Step.pvd          (ParaView registry, see setOutputCollection)
+   //   <save_dir>/Step/Cycle*       (ParaView per-frame data, written by Save)
+   //   <save_dir>/Checkpoint/...    (single-slot state snapshot, see CheckpointDir)
+   std::string CheckpointDir() const { return _save_dir + "/Checkpoint"; }
+   const std::string &SaveDir() const { return _save_dir; }
 
    // One-shot setup: builds everything, sets ICs, assembles M and an initial
    // K_mat, and registers ParaView fields.  Call after construction, before
    // entering the time loop.
-   void Setup();
+   //
+   // If restart_dir is non-empty, Setup loads the mesh and the four
+   // ParGridFunctions (T, omega, n, phi) from that directory instead of
+   // constructing a fresh Cartesian mesh and applying initial conditions.
+   // The caller is responsible for having read the scalar metadata
+   // (t, step) via LoadCheckpointMeta beforehand.
+   void Setup(const std::string &restart_dir);
+
+   // Write a single-slot checkpoint into `dir`.  All ranks must participate.
+   // Overwrites any previous checkpoint in `dir`.  The output is:
+   //   <dir>/meta.txt          (rank 0; "t <value>\nstep <int>\n")
+   //   <dir>/mesh.NNNNNN       (per-rank ParMesh::ParPrint)
+   //   <dir>/T.NNNNNN          (per-rank ParGridFunction::Save)
+   //   <dir>/omega.NNNNNN
+   //   <dir>/n.NNNNNN
+   //   <dir>/phi.NNNNNN
+   void SaveCheckpoint(const std::string &dir, real_t t, int step) const;
+
+   // Read `dir/meta.txt` on rank 0 and broadcast t/step to all ranks.
+   // Static so main() can call it before constructing the problem object.
+   static void LoadCheckpointMeta(const std::string &dir, MPI_Comm comm,
+                                  real_t &t, int &step);
 
    // Per-implicit-stage primitives -----------------------------------------
    //   Pull the omega block out of a true-dof BlockVector (the predictor
@@ -162,6 +189,13 @@ private:
    void setInitialConditions();
    void setOutputCollection();
 
+   // Restart helpers.  `_restart_dir` is set at the top of Setup and read by
+   // buildMesh (to decide between Cartesian-fresh and load-from-disk) and by
+   // the IC dispatch (setInitialConditions vs loadFieldsFromCheckpoint).
+   void loadFieldsFromCheckpoint();
+   std::string _restart_dir;
+   std::string _save_dir;
+
 public:
    // Resample phi from the H1 grid function into the quadrature-point
    // buffer used by the reaction integrator.  Cheap (O(nelem * nQP)) and
@@ -189,7 +223,6 @@ private:
    // are static, so the matrix, AMG hierarchy, and CG solver are all built
    // once in Setup and reused every implicit stage; only the RHS is rebuilt.
    Array<int>                                    _ess_tdof_list_phi;
-   std::unique_ptr<ConstantCoefficient>          _one_phi;
    std::unique_ptr<GridFunctionCoefficient>      _omega_coef;
    std::unique_ptr<ProductCoefficient>           _neg_omega_coef;
    std::unique_ptr<ParBilinearForm>              _a_phi;
@@ -202,7 +235,6 @@ private:
    std::unique_ptr<Coefficient>                         _r;
    std::unique_ptr<Coefficient>                         _Sn;
    std::unique_ptr<MatrixConstantCoefficient>           _grad_rotate;
-   std::unique_ptr<GridFunctionCoefficient>             _phi_gfcoef;
    std::unique_ptr<GradientGridFunctionCoefficient>     _grad_phi;
    std::unique_ptr<MatrixVectorProductCoefficient>      _vd;
    std::unique_ptr<ScalarVectorProductCoefficient>      _v_E;

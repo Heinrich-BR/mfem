@@ -1,8 +1,5 @@
 #include "ex42p.hpp"
 
-#include <cmath>
-#include <utility>
-
 void RogersRicciNLFIntegrator::AssembleElementVector(
    const Array<const FiniteElement*> &el,
    ElementTransformation &Tr,
@@ -135,33 +132,49 @@ void RogersRicciNLFIntegrator::AssembleElementGrad(
 // ===========================================================================
 
 Ricci2DNonlinear::Ricci2DNonlinear(MPI_Comm comm, int order, int ref_levels,
-                                   real_t xL, real_t yL, int num_active)
+                                   real_t xL, real_t yL, int num_active,
+                                   const std::string &save_dir)
    : _xL(xL), _yL(yL), _order(order), _ref_levels(ref_levels),
      _num_active(num_active),
      _rotmat({{0.0, -1.0}, {1.0, 0.0}}),
-     _comm(comm)
+     _comm(comm),
+     _save_dir(save_dir)
 {
    MFEM_VERIFY(num_active >= 1 && num_active <= NUM_VARS,
                "Ricci2DNonlinear: num_active must be 1, 2, or 3.");
+   MFEM_VERIFY(!save_dir.empty(),
+               "Ricci2DNonlinear: save_dir must be non-empty.");
 }
 
-void Ricci2DNonlinear::Setup()
+void Ricci2DNonlinear::Setup(const std::string &restart_dir)
 {
+   // Cached for buildMesh and the IC-vs-load branch below.  Cleared at the
+   // end of Setup so subsequent stages never accidentally see it.
+   _restart_dir = restart_dir;
+
    buildMesh();
    buildSpaces();
    buildState();
    buildCoefficients();
    buildQuadratureSamples();
    buildMassMatrix();
-   setInitialConditions();
+
+   if (_restart_dir.empty())
+   {
+      setInitialConditions();
+   }
+   else
+   {
+      loadFieldsFromCheckpoint();
+   }
    syncBlocksFromGridFuncs(*_var_blocks);
 
    // Sn is geometry-only — project it into its quadrature-function buffer
    // once and the integrator will look it up with O(1) cost forever after.
    _Sn->Project(*_Sn_qf);
 
-   // phi starts uniform (constant 0.03) — seed the quadrature sample so the
-   // first F_form action sees the initial condition, not zeros.
+   // Seed the quadrature sample so the first F_form action sees the loaded
+   // (or initial) phi rather than zeros.
    projectPhiToQuadrature();
 
    buildNonlinearForm();
@@ -179,16 +192,37 @@ void Ricci2DNonlinear::Setup()
    // Initial K with zero v_d (phi is uniform → grad phi = 0).
    refreshDriftCoefs();
    reassembleK();
+
+   _restart_dir.clear();
 }
 
 void Ricci2DNonlinear::buildMesh()
 {
-   // Match ex41p: 64x64 quads on [0,xL] x [0,yL].
-   Mesh mesh = Mesh::MakeCartesian2D(64, 64, Element::QUADRILATERAL, true,
-                                     _xL, _yL, false);
-   for (int l = 0; l < _ref_levels; ++l) { mesh.UniformRefinement(); }
-
-   _pmesh = std::make_unique<ParMesh>(_comm, mesh);
+   if (_restart_dir.empty())
+   {
+      // Match ex41p: 64x64 quads on [0,xL] x [0,yL].  Refine in parallel —
+      // each rank only owns its share of refined elements, which scales
+      // better than refining the serial mesh before partitioning.
+      Mesh mesh = Mesh::MakeCartesian2D(64, 64, Element::QUADRILATERAL, true,
+                                        _xL, _yL, false);
+      _pmesh = std::make_unique<ParMesh>(_comm, mesh);
+      for (int l = 0; l < _ref_levels; ++l) { _pmesh->UniformRefinement(); }
+   }
+   else
+   {
+      // Load the partitioned mesh that was saved by SaveCheckpoint on the
+      // previous run.  Per-rank file format means the rank count must match;
+      // a missing file means the run was saved with a different np.
+      const int myid = Mpi::WorldRank();
+      const std::string fname =
+         MakeParFilename(_restart_dir + "/mesh.", myid);
+      std::ifstream ifs(fname);
+      MFEM_VERIFY(ifs.good(),
+                  "Ricci2DNonlinear: cannot open checkpoint mesh '" << fname
+                  << "'. Was the previous run launched with the same number "
+                  "of MPI ranks?");
+      _pmesh = std::make_unique<ParMesh>(_comm, ifs);
+   }
    _h = _pmesh->GetElementSize(_pmesh->GetTypicalElementTransformation());
 }
 
@@ -243,7 +277,6 @@ void Ricci2DNonlinear::buildCoefficients()
 
    // phi-dependent coefficients.  v_d = R · grad(phi) with R = [[0,-1],[1,0]],
    // so v_d = (-d_y phi, d_x phi) — the ExB-drift direction in normalised units.
-   _phi_gfcoef = std::make_unique<GridFunctionCoefficient>(_phi.get());
    _grad_phi   = std::make_unique<GradientGridFunctionCoefficient>(_phi.get());
    _vd         = std::make_unique<MatrixVectorProductCoefficient>(*_grad_rotate,
                                                                   *_grad_phi);
@@ -321,9 +354,9 @@ void Ricci2DNonlinear::buildPhiSolver()
    _h1_fes->GetEssentialTrueDofs(ess_bdr, _ess_tdof_list_phi);
 
    // Bilinear form: ∇·∇  (assembled once; the operator is static).
-   _one_phi = std::make_unique<ConstantCoefficient>(1.0);
-   _a_phi   = std::make_unique<ParBilinearForm>(_h1_fes.get());
-   _a_phi->AddDomainIntegrator(new DiffusionIntegrator(*_one_phi));
+   // DiffusionIntegrator() with no coefficient defaults to coefficient = 1.
+   _a_phi = std::make_unique<ParBilinearForm>(_h1_fes.get());
+   _a_phi->AddDomainIntegrator(new DiffusionIntegrator());
    _a_phi->Assemble();
    _a_phi->Finalize();
 
@@ -336,15 +369,12 @@ void Ricci2DNonlinear::buildPhiSolver()
    _b_phi          = std::make_unique<ParLinearForm>(_h1_fes.get());
    _b_phi->AddDomainIntegrator(new DomainLFIntegrator(*_neg_omega_coef));
 
-   // Trigger the BC-elimination path once so _A_phi points to the
-   // already-eliminated p_mat.  Subsequent FormLinearSystem calls in
-   // updatePhi will reuse this matrix (see ParBilinearForm::FormSystemMatrix
+   // Eliminate the Dirichlet rows/cols once and stash the eliminated
+   // parallel matrix in _A_phi.  Subsequent FormLinearSystem calls in
+   // updatePhi reuse the same matrix (see ParBilinearForm::FormSystemMatrix
    // — after the first call, `mat` is NULL and only the BC application on B
    // is repeated, with no re-assembly cost).
-   _b_phi->Assemble();
-   Vector X_tmp, B_tmp;
-   _a_phi->FormLinearSystem(_ess_tdof_list_phi, *_phi, *_b_phi,
-                            _A_phi, X_tmp, B_tmp);
+   _a_phi->FormSystemMatrix(_ess_tdof_list_phi, _A_phi);
 
    // AMG hierarchy built once against the eliminated parallel matrix.
    _amg_phi = std::make_unique<HypreBoomerAMG>();
@@ -380,12 +410,161 @@ void Ricci2DNonlinear::setInitialConditions()
 
 void Ricci2DNonlinear::setOutputCollection()
 {
-   _dc = std::make_unique<ParaViewDataCollection>("Ricci2DNonlinearOpt/Step",
+   // The collection prefix is "<save_dir>/Step", so ParaView writes
+   //   <save_dir>/Step/Step.pvd
+   //   <save_dir>/Step/Cycle000000/data.pvtu  etc.
+   // (sibling to <save_dir>/Checkpoint/ which holds the restart state).
+   _dc = std::make_unique<ParaViewDataCollection>(_save_dir + "/Step",
                                                   _pmesh.get());
    _dc->RegisterField("phi",   _phi.get());
    _dc->RegisterField("T",     _vars[T_IDX].get());
    _dc->RegisterField("omega", _vars[OMEGA_IDX].get());
    _dc->RegisterField("n",     _vars[N_IDX].get());
+
+   // Preserve existing <DataSet> entries in Step.pvd whose timestep is less
+   // than the current GetTime() when Save() is called.  No effect on a fresh
+   // run (no pre-existing .pvd) and required for restart to produce a
+   // continuous trajectory.  See ParaViewDataCollection::Save in
+   // mfem/fem/datacollection.cpp:875.
+   _dc->UseRestartMode(true);
+}
+
+namespace
+{
+// Variable name in the per-rank checkpoint file for each block index.
+const char *checkpoint_var_name(int idx)
+{
+   switch (idx)
+   {
+      case T_IDX:     return "T";
+      case OMEGA_IDX: return "omega";
+      case N_IDX:     return "n";
+      default:        MFEM_ABORT("unknown VarIdx"); return "";
+   }
+}
+} // namespace
+
+void Ricci2DNonlinear::loadFieldsFromCheckpoint()
+{
+   const int myid = Mpi::WorldRank();
+
+   // Load the three evolved variables.  The ParGridFunction istream
+   // constructor builds its own FE collection + space on _pmesh, so the
+   // loaded function lives on a parallel FE space congruent with _h1_fes
+   // by construction (same mesh, same FE collection encoded in the file
+   // header).  We copy the values into _vars[i] so the live FES pointer
+   // stays unchanged.
+   for (int i = 0; i < NUM_VARS; ++i)
+   {
+      const std::string fname = MakeParFilename(
+         _restart_dir + "/" + checkpoint_var_name(i) + ".", myid);
+      std::ifstream ifs(fname);
+      MFEM_VERIFY(ifs.good(),
+                  "Ricci2DNonlinear: cannot open checkpoint field '"
+                  << fname << "'.");
+      ParGridFunction tmp(_pmesh.get(), ifs);
+      MFEM_VERIFY(tmp.Size() == _vars[i]->Size(),
+                  "Ricci2DNonlinear: size mismatch loading '" << fname
+                  << "' (got " << tmp.Size() << ", expected "
+                  << _vars[i]->Size() << ").");
+      *_vars[i] = tmp;        // Vector elementwise copy; FES pointer untouched.
+   }
+
+   // Same treatment for phi.  Its Dirichlet boundary values are part of the
+   // saved data, so the loaded state has the correct BC on the first
+   // post-restart Poisson solve.
+   const std::string phi_fname =
+      MakeParFilename(_restart_dir + "/phi.", myid);
+   std::ifstream ifs_phi(phi_fname);
+   MFEM_VERIFY(ifs_phi.good(),
+               "Ricci2DNonlinear: cannot open checkpoint field '"
+               << phi_fname << "'.");
+   ParGridFunction tmp_phi(_pmesh.get(), ifs_phi);
+   MFEM_VERIFY(tmp_phi.Size() == _phi->Size(),
+               "Ricci2DNonlinear: size mismatch loading phi.");
+   *_phi = tmp_phi;
+}
+
+void Ricci2DNonlinear::SaveCheckpoint(const std::string &dir, real_t t,
+                                      int step) const
+{
+   const int myid = Mpi::WorldRank();
+
+   // Rank 0 creates the leaf directory (its parent <save_dir>/ was already
+   // created recursively by ParaViewDataCollection::Save just before us) and
+   // writes meta.txt.  create_directory returns false if the directory
+   // already exists (which is fine in single-slot mode); it only sets ec on
+   // hard filesystem errors.
+   if (myid == 0)
+   {
+      std::error_code ec;
+      std::filesystem::create_directory(dir, ec);
+      MFEM_VERIFY(!ec,
+                  "Ricci2DNonlinear::SaveCheckpoint: cannot create '"
+                  << dir << "': " << ec.message() << ".");
+
+      std::ofstream meta(dir + "/meta.txt", std::ios::trunc);
+      MFEM_VERIFY(meta.good(),
+                  "Ricci2DNonlinear::SaveCheckpoint: cannot open meta.txt "
+                  "for writing.");
+      meta.precision(17);
+      meta << "t " << t << "\n";
+      meta << "step " << step << "\n";
+   }
+   // Wait until the directory exists before any other rank writes into it.
+   MPI_Barrier(_comm);
+
+   // Per-rank mesh.
+   {
+      std::ofstream ofs(MakeParFilename(dir + "/mesh.", myid));
+      MFEM_VERIFY(ofs.good(),
+                  "Ricci2DNonlinear::SaveCheckpoint: cannot open mesh file "
+                  "for writing.");
+      ofs.precision(17);
+      _pmesh->ParPrint(ofs);
+   }
+
+   // Per-rank fields.
+   auto save_gf = [&](const std::string &name, const ParGridFunction &gf)
+   {
+      std::ofstream ofs(MakeParFilename(dir + "/" + name + ".", myid));
+      MFEM_VERIFY(ofs.good(),
+                  "Ricci2DNonlinear::SaveCheckpoint: cannot open field '"
+                  << name << "' for writing.");
+      ofs.precision(17);
+      gf.Save(ofs);
+   };
+   for (int i = 0; i < NUM_VARS; ++i)
+   {
+      save_gf(checkpoint_var_name(i), *_vars[i]);
+   }
+   save_gf("phi", *_phi);
+
+   // Make sure rank 0's meta.txt is visible to any spawned reader.
+   MPI_Barrier(_comm);
+}
+
+void Ricci2DNonlinear::LoadCheckpointMeta(const std::string &dir,
+                                          MPI_Comm comm,
+                                          real_t &t, int &step)
+{
+   int myid;
+   MPI_Comm_rank(comm, &myid);
+
+   if (myid == 0)
+   {
+      std::ifstream ifs(dir + "/meta.txt");
+      MFEM_VERIFY(ifs.good(),
+                  "LoadCheckpointMeta: cannot open '" << dir
+                  << "/meta.txt'.");
+      std::string key;
+      ifs >> key >> t;
+      MFEM_VERIFY(key == "t", "LoadCheckpointMeta: expected 't' key.");
+      ifs >> key >> step;
+      MFEM_VERIFY(key == "step", "LoadCheckpointMeta: expected 'step' key.");
+   }
+   MPI_Bcast(&t,    1, MPITypeMap<real_t>::mpi_type, 0, comm);
+   MPI_Bcast(&step, 1, MPI_INT,                      0, comm);
 }
 
 void Ricci2DNonlinear::syncGridFuncsFromBlocks(const BlockVector &u_blk)
@@ -430,11 +609,11 @@ void Ricci2DNonlinear::updatePhi()
 
 void Ricci2DNonlinear::refreshDriftCoefs()
 {
-   // GradientGridFunctionCoefficient / MatrixVectorProductCoefficient /
-   // NormalizedVectorCoefficient / OuterProductCoefficient all evaluate
-   // lazily from the underlying state — there is no cached data to
-   // invalidate.  This hook exists for clarity and as a place to hang
-   // diagnostics later.
+   // The drift coefficient chain (GradientGridFunctionCoefficient,
+   // MatrixVectorProductCoefficient, OuterProductCoefficient,
+   // TransformedCoefficient for the smooth SUW regularisation) evaluates
+   // lazily from the live _phi — no cached data to invalidate.  This hook
+   // exists as a documented call site for future diagnostics.
 }
 
 void Ricci2DNonlinear::reassembleK()
@@ -579,7 +758,7 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
 }
 
 // ===========================================================================
-//             SuperLU adapter + RicciTimeOperator implementation
+//   Newton line search, block Krylov solver, RicciTimeOperator implementation
 // ===========================================================================
 
 namespace
@@ -768,10 +947,10 @@ void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
    _ricci.reassembleK();
    _ricci.projectPhiToQuadrature();
 
-   // (5) Wire up the stage equation R(k) = M k + K(u + γk) + F(u + γk).
+   // (6) Wire up the stage equation R(k) = M k + K(u + γk) + F(u + γk).
    _stage_op.SetParameters(gamma, u_pred_blk);
 
-   // (6) Newton drives R(k) = 0.  Empty `b` is interpreted as zero RHS.
+   // (7) Newton drives R(k) = 0.  Empty `b` is interpreted as zero RHS.
    k = 0.0;
    Vector zero;
    _newton->Mult(zero, k);
@@ -792,8 +971,7 @@ int main(int argc, char *argv[])
                                         //  matching backend; on GPU also
                                         //  needs HYPRE_USING_GPU).
    int    order             = 1;
-   int    ser_ref_levels    = 0;
-   int    par_ref_levels    = 0;
+   int    ref_levels        = 0;
    int    ode_solver_type   = 21;   // 21 = Backward Euler; 23 = SDIRK23
    real_t xL                = 100.0;   // domain = [0, 100]² in rho_s0 units
    real_t yL                = 100.0;
@@ -809,6 +987,8 @@ int main(int argc, char *argv[])
    real_t ew_rtol_max       = 0.9;
    int    num_active        = NUM_VARS;
    int    vis_steps         = 1;
+   std::string save_dir = "Ricci2DNonlinear";
+   //const char *save_dir_cstr = "Ricci2DNonlinear";
 
    OptionsParser args(argc, argv);
    args.AddOption(&device_config, "-d", "--device",
@@ -816,10 +996,9 @@ int main(int argc, char *argv[])
                   "(e.g. 'cpu', 'cuda', 'hip').");
    args.AddOption(&order, "-o", "--order",
                   "Polynomial degree of the H1 finite element space.");
-   args.AddOption(&ser_ref_levels, "-rs", "--refine-serial",
-                  "Serial uniform refinements before partitioning.");
-   args.AddOption(&par_ref_levels, "-rp", "--refine-parallel",
-                  "Parallel uniform refinements after partitioning.");
+   args.AddOption(&ref_levels, "-r", "--refine",
+                  "Number of uniform parallel refinement levels applied to "
+                  "the 64x64 base mesh.");
    args.AddOption(&ode_solver_type, "-s", "--ode-solver",
                   ODESolver::Types.c_str());
    args.AddOption(&xL, "-xL", "--x-length", "Domain length in x.");
@@ -848,6 +1027,14 @@ int main(int argc, char *argv[])
                   "2 = T and omega, 3 = T, omega, and n (full system).");
    args.AddOption(&vis_steps, "-vs", "--visualization-steps",
                   "Save ParaView output every N steps.");
+   args.AddOption(&save_dir, "-sd", "--save-directory",
+                  "Top-level output directory.  ParaView frames are written "
+                  "to <save_dir>/Step/, single-slot checkpoint state to "
+                  "<save_dir>/Checkpoint/.  If the checkpoint directory "
+                  "already contains a meta.txt at startup, the run resumes "
+                  "from it; otherwise it starts fresh and writes new "
+                  "checkpoints there at every visualisation step.  Restart "
+                  "requires the same MPI rank count as the previous run.");
    args.Parse();
    if (!args.Good())
    {
@@ -856,20 +1043,54 @@ int main(int argc, char *argv[])
    }
    if (myid == 0) { args.PrintOptions(std::cout); }
 
-   // Configure the Device AFTER parsing so -d cuda/hip can be honoured.
-   // Done before any FE space / vector allocation so memory classes are set
-   // correctly on construction.
    Device device(device_config);
    if (myid == 0) { device.Print(); }
 
-   Ricci2DNonlinear ricci(MPI_COMM_WORLD, order, ser_ref_levels, xL, yL,
-                          num_active);
-   ricci.Setup();
+   // The checkpoint directory is a fixed subfolder of the save directory.
+   // meta.txt is the designated single-file marker — if it exists, the rest
+   // of the checkpoint files are assumed to be there too (we verify per-file
+   // when we open them).
+   const std::string cdir = save_dir + "/Checkpoint";
+   real_t t    = 0.0;
+   int    step = 0;
+   bool   restart = false;
+   {
+      // Check if there is a checkpoint metadata file
+      restart = std::filesystem::exists(cdir + "/meta.txt");
+      if (restart)
+      {
+         Ricci2DNonlinear::LoadCheckpointMeta(cdir, MPI_COMM_WORLD, t, step);
+         if (myid == 0)
+         {
+            std::cout << "Restarting from checkpoint '" << cdir
+                      << "' at t = " << t << ", step = " << step << "."
+                      << std::endl;
+         }
+      }
+      else if (myid == 0)
+      {
+         std::cout << "No checkpoint at '" << cdir
+                   << "': starting fresh.  ParaView output -> '"
+                   << save_dir << "/Step', checkpoints -> '" << cdir
+                   << "'." << std::endl;
+      }
+   }
 
-   // Initial save.
+   Ricci2DNonlinear ricci(MPI_COMM_WORLD, order, ref_levels, xL, yL,
+                          num_active, save_dir);
+   ricci.Setup(restart ? cdir : "");
+
+   // On a fresh start, write the t = 0 frame so the ParaView trajectory
+   // begins at the initial condition.  On restart, skip it: the loaded
+   // state's `step` was already emitted at checkpoint time and the
+   // ParaViewDataCollection forbids overwriting an existing cycle when
+   // UseRestartMode is on.
    ricci.syncGridFuncsFromBlocks(*ricci.StateBlocks());
-   ricci.updateDataCollection(0, 0.0);
-   ricci.Save();
+   if (!restart)
+   {
+      ricci.updateDataCollection(0, 0.0);
+      ricci.Save();
+   }
 
    if (myid == 0)
    {
@@ -891,9 +1112,12 @@ int main(int argc, char *argv[])
    std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(ode_solver_type);
    ode_solver->Init(time_op);
 
-   real_t t = 0.0;
-   int step = 0;
-   while (t < t_final)
+   // Tolerance for the loop termination check: stops a sub-machine-epsilon
+   // "phantom step" from firing at t_final due to floating-point
+   // accumulation in t (i.e. t < t_final is true by ~1e-18 but dt_step is
+   // essentially zero).
+   const real_t t_tol = 1e-12 * std::max(t_final, dt);
+   while (t < t_final - t_tol)
    {
       real_t dt_step = std::min(dt, t_final - t);
       ode_solver->Step(*ricci.StateBlocks(), t, dt_step);
@@ -918,6 +1142,7 @@ int main(int argc, char *argv[])
       {
          ricci.updateDataCollection(step, t);
          ricci.Save();
+         ricci.SaveCheckpoint(cdir, t, step);
       }
    }
 
