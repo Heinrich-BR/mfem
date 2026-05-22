@@ -127,10 +127,6 @@ void RogersRicciNLFIntegrator::AssembleElementGrad(
    }
 }
 
-// ===========================================================================
-//                       Ricci2DNonlinear implementation
-// ===========================================================================
-
 Ricci2DNonlinear::Ricci2DNonlinear(MPI_Comm comm, int order, int ref_levels,
                                    real_t xL, real_t yL, int num_active,
                                    const std::string &save_dir)
@@ -148,8 +144,6 @@ Ricci2DNonlinear::Ricci2DNonlinear(MPI_Comm comm, int order, int ref_levels,
 
 void Ricci2DNonlinear::Setup(const std::string &restart_dir)
 {
-   // Cached for buildMesh and the IC-vs-load branch below.  Cleared at the
-   // end of Setup so subsequent stages never accidentally see it.
    _restart_dir = restart_dir;
 
    buildMesh();
@@ -160,37 +154,20 @@ void Ricci2DNonlinear::Setup(const std::string &restart_dir)
    buildMassMatrix();
 
    if (_restart_dir.empty())
-   {
       setInitialConditions();
-   }
    else
-   {
       loadFieldsFromCheckpoint();
-   }
+
    syncBlocksFromGridFuncs(*_var_blocks);
 
-   // Sn is geometry-only — project it into its quadrature-function buffer
-   // once and the integrator will look it up with O(1) cost forever after.
    _Sn->Project(*_Sn_qf);
 
-   // Seed the quadrature sample so the first F_form action sees the loaded
-   // (or initial) phi rather than zeros.
    projectPhiToQuadrature();
 
    buildNonlinearForm();
-   setOutputCollection();
-
-   // Build the phi-Poisson solver once: the Laplacian operator and the
-   // boundary topology don't change with time, so we can amortise the AMG
-   // setup across every implicit stage.
+   setOutput();
    buildPhiSolver();
-
-   // Build the K (advection + SUW) bilinear form once with the integrators
-   // wired to live coefficients; reassembleK() will Update/Assemble in place.
    buildKForm();
-
-   // Initial K with zero v_d (phi is uniform → grad phi = 0).
-   refreshDriftCoefs();
    reassembleK();
 
    _restart_dir.clear();
@@ -200,9 +177,6 @@ void Ricci2DNonlinear::buildMesh()
 {
    if (_restart_dir.empty())
    {
-      // Match ex41p: 64x64 quads on [0,xL] x [0,yL].  Refine in parallel —
-      // each rank only owns its share of refined elements, which scales
-      // better than refining the serial mesh before partitioning.
       Mesh mesh = Mesh::MakeCartesian2D(64, 64, Element::QUADRILATERAL, true,
                                         _xL, _yL, false);
       _pmesh = std::make_unique<ParMesh>(_comm, mesh);
@@ -210,9 +184,7 @@ void Ricci2DNonlinear::buildMesh()
    }
    else
    {
-      // Load the partitioned mesh that was saved by SaveCheckpoint on the
-      // previous run.  Per-rank file format means the rank count must match;
-      // a missing file means the run was saved with a different np.
+      // Load the partitioned mesh from previous run
       const int myid = Mpi::WorldRank();
       const std::string fname =
          MakeParFilename(_restart_dir + "/mesh.", myid);
@@ -236,17 +208,16 @@ void Ricci2DNonlinear::buildState()
 {
    _vars.resize(NUM_VARS);
    for (int i = 0; i < NUM_VARS; ++i)
-   {
       _vars[i] = std::make_unique<ParGridFunction>(_h1_fes.get());
-   }
+
    _phi = std::make_unique<ParGridFunction>(_h1_fes.get());
 
    _block_trueOffsets.SetSize(NUM_VARS + 1);
    _block_trueOffsets[0] = 0;
+
    for (int i = 0; i < NUM_VARS; ++i)
-   {
       _block_trueOffsets[i + 1] = _h1_fes->GetTrueVSize();
-   }
+   
    _block_trueOffsets.PartialSum();
 
    _var_blocks = std::make_unique<BlockVector>(_block_trueOffsets);
@@ -254,17 +225,14 @@ void Ricci2DNonlinear::buildState()
 
 void Ricci2DNonlinear::buildCoefficients()
 {
-   // Radial distance from mesh centre (used by S_n, lifted verbatim from ex41p).
+   // Radial distance from mesh centre
    _r.reset(new TransformedCoefficient(
                new CartesianXCoefficient, new CartesianYCoefficient,
                [this](real_t x, real_t y) {
       return std::sqrt(std::pow(x - _xL/2.0, 2) + std::pow(y - _yL/2.0, 2));
    }));
 
-   // Firedrake reference form (rr.py:rr_src_ufl):
-   //   S(r) = (S_0n / 2) * (1 - tanh((r - rs) / Ls))
-   // with rs = 20*rho_s0, Ls = 0.5*rho_s0.  Since the mesh is now in rho_s0
-   // units, rs and Ls are taken as 20 and 0.5 in mesh units directly.
+   // Source term
    const real_t rs = 20.0;
    const real_t Ls = 0.5;
    _Sn.reset(new TransformedCoefficient(
@@ -272,51 +240,37 @@ void Ricci2DNonlinear::buildCoefficients()
       return 0.5 * _S_0n * (1.0 - std::tanh((r - rs) / Ls));
    }));
 
-   // 90° rotation matrix, used to build v_d from grad(phi).
    _grad_rotate = std::make_unique<MatrixConstantCoefficient>(_rotmat);
+   _grad_phi = std::make_unique<GradientGridFunctionCoefficient>(_phi.get());
+   _vd = std::make_unique<MatrixVectorProductCoefficient>(*_grad_rotate, *_grad_phi);
 
-   // phi-dependent coefficients.  v_d = R · grad(phi) with R = [[0,-1],[1,0]],
-   // so v_d = (-d_y phi, d_x phi) — the ExB-drift direction in normalised units.
-   _grad_phi   = std::make_unique<GradientGridFunctionCoefficient>(_phi.get());
-   _vd         = std::make_unique<MatrixVectorProductCoefficient>(*_grad_rotate,
-                                                                  *_grad_phi);
-
-   // True drift velocity v_E = (1/B) * v_d.  This is what appears in both the
-   // convection term (-(1/B) pb(u, phi) = -v_E · grad(u)) and in the
-   // streamline-upwinding stabilisation in the Firedrake reference.
+   // Drift velocity:
+   // v_E = (1/B) * v_d
    _v_E = std::make_unique<ScalarVectorProductCoefficient>(_Binv, *_vd);
 
-   // SUW matching Firedrake's SU_term (rr.py:54-63):
-   //     0.5 * h * (v_E · grad u)(v_E · grad v) / sqrt(|v_E|^2 + eps^2)
-   // As a DiffusionIntegrator(M) bilinear form with M = c(x) * v_E ⊗ v_E,
-   // where c(x) = h / (2 sqrt(|v_E|^2 + eps^2)) — a *smooth* regularisation,
-   // contrasting with MFEM's NormalizedVectorCoefficient which is a
-   // threshold (returns zero below tol).  The smooth form caps the SUW
-   // coefficient at h/(2*eps) when v_E -> 0, which keeps the Jacobian
-   // well-conditioned in regions where the drift velocity vanishes.
-   _v_E_sq     = std::make_unique<InnerProductCoefficient>(*_v_E, *_v_E);
+   // SUW term:
+   // 0.5 * h * (v_E · grad u)(v_E · grad v) / sqrt(|v_E|^2 + eps^2)
+   _v_E_sq = std::make_unique<InnerProductCoefficient>(*_v_E, *_v_E);
    _suw_scalar = std::make_unique<TransformedCoefficient>(
                     _v_E_sq.get(),
                     [h = _h, eps2 = _eps2](real_t v_sq)
    {
       return h / (2.0 * std::sqrt(v_sq + eps2));
    });
-   _v_E_outer   = std::make_unique<OuterProductCoefficient>(*_v_E, *_v_E);
+   _v_E_outer = std::make_unique<OuterProductCoefficient>(*_v_E, *_v_E);
    _SUW_matcoef = std::make_unique<ScalarMatrixProductCoefficient>(
                      *_suw_scalar, *_v_E_outer);
 }
 
 void Ricci2DNonlinear::buildQuadratureSamples()
 {
-   // Same order as RogersRicciNLFIntegrator's integration rule (2p+3), so
-   // QuadratureFunctionCoefficient::Eval indexes into the same point set
-   // the integrator iterates over.
+   // This is to accelerate coefficient evaluations of Sn and phi
    const int qorder = 2 * _order + 3;
-   _qspace  = std::make_unique<QuadratureSpace>(_pmesh.get(), qorder);
-   _phi_qf  = std::make_unique<QuadratureFunction>(*_qspace);
-   _Sn_qf   = std::make_unique<QuadratureFunction>(*_qspace);
+   _qspace = std::make_unique<QuadratureSpace>(_pmesh.get(), qorder);
+   _phi_qf = std::make_unique<QuadratureFunction>(*_qspace);
+   _Sn_qf = std::make_unique<QuadratureFunction>(*_qspace);
    _phi_qfc = std::make_unique<QuadratureFunctionCoefficient>(*_phi_qf);
-   _Sn_qfc  = std::make_unique<QuadratureFunctionCoefficient>(*_Sn_qf);
+   _Sn_qfc = std::make_unique<QuadratureFunctionCoefficient>(*_Sn_qf);
 }
 
 void Ricci2DNonlinear::projectPhiToQuadrature()
@@ -335,10 +289,9 @@ void Ricci2DNonlinear::buildMassMatrix()
 
 void Ricci2DNonlinear::buildKForm()
 {
+   // Poisson + SUW terms
    // K = -(1/B) (v_d · grad u, v) + (c v_E ⊗ v_E : grad u ⊗ grad v).
-   // The integrators reference the live coefficients owned by Ricci2DNonlinear,
-   // so updates to phi (and hence v_d, v_E) flow through to the next Assemble
-   // without rewiring.
+   // The integrators reference the live coefficients owned by Ricci2DNonlinear
    _K_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
    _K_form->AddDomainIntegrator(new ConvectionIntegrator(*_vd, -_Binv));
    _K_form->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef));
@@ -346,37 +299,23 @@ void Ricci2DNonlinear::buildKForm()
 
 void Ricci2DNonlinear::buildPhiSolver()
 {
-   // Essential dofs: Dirichlet on every boundary attribute (values held at
-   // whatever _phi was set to in setInitialConditions, i.e. the constant
-   // 0.03 used as the symmetry-breaking inlet potential).
    Array<int> ess_bdr(_pmesh->bdr_attributes.Max());
    ess_bdr = 1;
    _h1_fes->GetEssentialTrueDofs(ess_bdr, _ess_tdof_list_phi);
 
-   // Bilinear form: ∇·∇  (assembled once; the operator is static).
-   // DiffusionIntegrator() with no coefficient defaults to coefficient = 1.
    _a_phi = std::make_unique<ParBilinearForm>(_h1_fes.get());
    _a_phi->AddDomainIntegrator(new DiffusionIntegrator());
    _a_phi->Assemble();
    _a_phi->Finalize();
 
-   // Long-lived linear form: omega coefficient is a live view into the
-   // _vars[OMEGA_IDX] grid function, so re-Assembling each stage picks up
-   // the latest predictor state.
-   _omega_coef     = std::make_unique<GridFunctionCoefficient>(
+   _omega_coef = std::make_unique<GridFunctionCoefficient>(
                         _vars[OMEGA_IDX].get());
    _neg_omega_coef = std::make_unique<ProductCoefficient>(-1.0, *_omega_coef);
-   _b_phi          = std::make_unique<ParLinearForm>(_h1_fes.get());
+   _b_phi = std::make_unique<ParLinearForm>(_h1_fes.get());
    _b_phi->AddDomainIntegrator(new DomainLFIntegrator(*_neg_omega_coef));
 
-   // Eliminate the Dirichlet rows/cols once and stash the eliminated
-   // parallel matrix in _A_phi.  Subsequent FormLinearSystem calls in
-   // updatePhi reuse the same matrix (see ParBilinearForm::FormSystemMatrix
-   // — after the first call, `mat` is NULL and only the BC application on B
-   // is repeated, with no re-assembly cost).
    _a_phi->FormSystemMatrix(_ess_tdof_list_phi, _A_phi);
 
-   // AMG hierarchy built once against the eliminated parallel matrix.
    _amg_phi = std::make_unique<HypreBoomerAMG>();
    _amg_phi->SetPrintLevel(0);
    _amg_phi->SetOperator(*_A_phi);
@@ -392,7 +331,9 @@ void Ricci2DNonlinear::buildPhiSolver()
 void Ricci2DNonlinear::buildNonlinearForm()
 {
    Array<ParFiniteElementSpace*> fes(NUM_VARS);
-   for (int i = 0; i < NUM_VARS; ++i) { fes[i] = _h1_fes.get(); }
+
+   for (int i = 0; i < NUM_VARS; ++i) 
+      fes[i] = _h1_fes.get();
 
    _F_form = std::make_unique<ParBlockNonlinearForm>(fes);
    _F_form->AddDomainIntegrator(
@@ -408,24 +349,14 @@ void Ricci2DNonlinear::setInitialConditions()
    *_vars[N_IDX]      = 1.0e-4;
 }
 
-void Ricci2DNonlinear::setOutputCollection()
+void Ricci2DNonlinear::setOutput()
 {
-   // The collection prefix is "<save_dir>/Step", so ParaView writes
-   //   <save_dir>/Step/Step.pvd
-   //   <save_dir>/Step/Cycle000000/data.pvtu  etc.
-   // (sibling to <save_dir>/Checkpoint/ which holds the restart state).
    _dc = std::make_unique<ParaViewDataCollection>(_save_dir + "/Step",
                                                   _pmesh.get());
-   _dc->RegisterField("phi",   _phi.get());
-   _dc->RegisterField("T",     _vars[T_IDX].get());
+   _dc->RegisterField("phi", _phi.get());
+   _dc->RegisterField("T", _vars[T_IDX].get());
    _dc->RegisterField("omega", _vars[OMEGA_IDX].get());
-   _dc->RegisterField("n",     _vars[N_IDX].get());
-
-   // Preserve existing <DataSet> entries in Step.pvd whose timestep is less
-   // than the current GetTime() when Save() is called.  No effect on a fresh
-   // run (no pre-existing .pvd) and required for restart to produce a
-   // continuous trajectory.  See ParaViewDataCollection::Save in
-   // mfem/fem/datacollection.cpp:875.
+   _dc->RegisterField("n", _vars[N_IDX].get());
    _dc->UseRestartMode(true);
 }
 
@@ -448,12 +379,6 @@ void Ricci2DNonlinear::loadFieldsFromCheckpoint()
 {
    const int myid = Mpi::WorldRank();
 
-   // Load the three evolved variables.  The ParGridFunction istream
-   // constructor builds its own FE collection + space on _pmesh, so the
-   // loaded function lives on a parallel FE space congruent with _h1_fes
-   // by construction (same mesh, same FE collection encoded in the file
-   // header).  We copy the values into _vars[i] so the live FES pointer
-   // stays unchanged.
    for (int i = 0; i < NUM_VARS; ++i)
    {
       const std::string fname = MakeParFilename(
@@ -467,12 +392,9 @@ void Ricci2DNonlinear::loadFieldsFromCheckpoint()
                   "Ricci2DNonlinear: size mismatch loading '" << fname
                   << "' (got " << tmp.Size() << ", expected "
                   << _vars[i]->Size() << ").");
-      *_vars[i] = tmp;        // Vector elementwise copy; FES pointer untouched.
+      *_vars[i] = tmp;
    }
 
-   // Same treatment for phi.  Its Dirichlet boundary values are part of the
-   // saved data, so the loaded state has the correct BC on the first
-   // post-restart Poisson solve.
    const std::string phi_fname =
       MakeParFilename(_restart_dir + "/phi.", myid);
    std::ifstream ifs_phi(phi_fname);
@@ -570,17 +492,13 @@ void Ricci2DNonlinear::LoadCheckpointMeta(const std::string &dir,
 void Ricci2DNonlinear::syncGridFuncsFromBlocks(const BlockVector &u_blk)
 {
    for (int i = 0; i < NUM_VARS; ++i)
-   {
       _vars[i]->SetFromTrueDofs(u_blk.GetBlock(i));
-   }
 }
 
 void Ricci2DNonlinear::syncBlocksFromGridFuncs(BlockVector &u_blk) const
 {
    for (int i = 0; i < NUM_VARS; ++i)
-   {
       _vars[i]->ParallelProject(u_blk.GetBlock(i));
-   }
 }
 
 void Ricci2DNonlinear::pullOmegaFromBlocks(const BlockVector &u_blk)
@@ -607,21 +525,9 @@ void Ricci2DNonlinear::updatePhi()
    _a_phi->RecoverFEMSolution(X, *_b_phi, *_phi);
 }
 
-void Ricci2DNonlinear::refreshDriftCoefs()
-{
-   // The drift coefficient chain (GradientGridFunctionCoefficient,
-   // MatrixVectorProductCoefficient, OuterProductCoefficient,
-   // TransformedCoefficient for the smooth SUW regularisation) evaluates
-   // lazily from the live _phi — no cached data to invalidate.  This hook
-   // exists as a documented call site for future diagnostics.
-}
-
 void Ricci2DNonlinear::reassembleK()
 {
-   // Update() drops the previous SparseMatrix and the eliminated parallel
-   // matrix without touching the attached integrators or coefficients, so
-   // the next Assemble re-uses the same integrator chain and just picks up
-   // the new v_d / v_E values that depend on the freshly-updated phi.
+   // Refresh the K matrix with the new V_d, V_E, phi values
    _K_form->Update();
    _K_form->Assemble();
    _K_form->Finalize();
@@ -757,18 +663,12 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
    return _Jac_block;
 }
 
-// ===========================================================================
-//   Newton line search, block Krylov solver, RicciTimeOperator implementation
-// ===========================================================================
-
 namespace
 {
-// Backtracking Armijo line search on top of MFEM's NewtonSolver.  Mirrors
-// PETSc's "snes_linesearch_type: l2" (which Firedrake's Rogers-Ricci config
-// uses, see 2Drogers-ricci.py:67-75).  Without this, a Newton step in the
-// stiff/swinging-phi regime can move the iterate to a state where the
-// reaction exp(Lambda - phi/T) is many orders of magnitude away from the
-// previous iterate, causing the residual to grow rather than shrink.
+// Backtracking Armijo line search on top of MFEM's NewtonSolver. Without 
+// this, a Newton step in the stiff/swinging-phi regime can move the iterate
+// to a state where the reaction exp(Lambda - phi/T) is many orders of 
+// magnitude away from the previous iterate, causing the residual to grow
 class BacktrackingNewtonSolver : public NewtonSolver
 {
 public:
@@ -897,12 +797,12 @@ private:
 };
 } // anonymous namespace
 
-RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear &ricci,
+RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear & ricci,
                                      real_t newton_rtol, int newton_max_iter,
                                      real_t lin_rtol, int lin_max_iter,
                                      int kdim)
    : TimeDependentOperator(ricci.BlockTrueOffsets().Last(),
-                           /*t=*/0.0,
+                           0.0,
                            TimeDependentOperator::IMPLICIT),
      _ricci(ricci),
      _stage_op(ricci),
@@ -910,7 +810,7 @@ RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear &ricci,
      _lin_solver(new BlockNewtonLinearSolver(comm, lin_rtol,
                                              lin_max_iter, kdim))
 {
-   _newton->iterative_mode = false;       // initial guess for k is zero
+   _newton->iterative_mode = false;
    _newton->SetSolver(*_lin_solver);
    _newton->SetOperator(_stage_op);
    _newton->SetRelTol(newton_rtol);
@@ -965,15 +865,12 @@ int main(int argc, char *argv[])
    const int myid = Mpi::WorldRank();
    Hypre::Init();
 
-   // ---- options ----------------------------------------------------------
-   const char *device_config = "cpu";   // "cuda", "hip", "occa-cpu", ...
-                                        // (requires MFEM/HYPRE built with the
-                                        //  matching backend; on GPU also
-                                        //  needs HYPRE_USING_GPU).
+   // Options
+   const char *device_config = "cpu";
    int    order             = 1;
    int    ref_levels        = 0;
-   int    ode_solver_type   = 21;   // 21 = Backward Euler; 23 = SDIRK23
-   real_t xL                = 100.0;   // domain = [0, 100]² in rho_s0 units
+   int    ode_solver_type   = 21; // 21 = Backward Euler; 23 = SDIRK23
+   real_t xL                = 100.0;
    real_t yL                = 100.0;
    real_t t_final           = 6.0;
    real_t dt                = 2.4e-3;
@@ -988,7 +885,6 @@ int main(int argc, char *argv[])
    int    num_active        = NUM_VARS;
    int    vis_steps         = 1;
    std::string save_dir = "Ricci2DNonlinear";
-   //const char *save_dir_cstr = "Ricci2DNonlinear";
 
    OptionsParser args(argc, argv);
    args.AddOption(&device_config, "-d", "--device",
@@ -1047,9 +943,6 @@ int main(int argc, char *argv[])
    if (myid == 0) { device.Print(); }
 
    // The checkpoint directory is a fixed subfolder of the save directory.
-   // meta.txt is the designated single-file marker — if it exists, the rest
-   // of the checkpoint files are assumed to be there too (we verify per-file
-   // when we open them).
    const std::string cdir = save_dir + "/Checkpoint";
    real_t t    = 0.0;
    int    step = 0;
@@ -1080,11 +973,6 @@ int main(int argc, char *argv[])
                           num_active, save_dir);
    ricci.Setup(restart ? cdir : "");
 
-   // On a fresh start, write the t = 0 frame so the ParaView trajectory
-   // begins at the initial condition.  On restart, skip it: the loaded
-   // state's `step` was already emitted at checkpoint time and the
-   // ParaViewDataCollection forbids overwriting an existing cycle when
-   // UseRestartMode is on.
    ricci.syncGridFuncsFromBlocks(*ricci.StateBlocks());
    if (!restart)
    {
