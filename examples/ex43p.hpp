@@ -1,5 +1,5 @@
-#ifndef MFEM_EX42P_HPP
-#define MFEM_EX42P_HPP
+#ifndef MFEM_EX43P_HPP
+#define MFEM_EX43P_HPP
 
 #include "mfem.hpp"
 #include <filesystem>
@@ -9,51 +9,87 @@ using namespace mfem;
 enum VarIdx : int { T_IDX = 0, OMEGA_IDX = 1, N_IDX = 2 };
 constexpr int NUM_VARS = 3;
 
-// Custom BlockNonlinearFormIntegrator implementing the nonlinear terms
-// F_T, F_omega, F_n
-class RogersRicciNLFIntegrator : public BlockNonlinearFormIntegrator
+// Device-native nonlinear reaction operator for the Rogers-Ricci system.
+// Replaces the host-only RogersRicciNLFIntegrator + ParBlockNonlinearForm
+// pipeline used by the original ex42p.  Pipeline:
+//   1. sampleStateToQPs:   true-dof z = (T, ω, n) -> per-block QFs for T, n
+//      (Prolongation -> ElementRestriction -> QuadratureInterpolator::Values,
+//       all device-native, all mfem::forall).
+//   2. computeReactionResidualAtQPs / computeReactionJacobianAtQPs: custom
+//      mfem::forall kernels that read T_qf, n_qf, phi_qf, Sn_qf and write
+//      F_*_qf (residual) and dF_*/du_*_qf (Jacobian entries).
+//   3. Mult:        three ParLinearForms with DomainLFIntegrator(QFC) take the
+//                   freshly-populated F_*_qf and assemble the residual blocks
+//                   on device (DLFEvalAssemble path).
+//   4. GetGradient: four ParBilinearForms with MassIntegrator(QFC) and
+//                   AssemblyLevel::PARTIAL produce device-native PA operators
+//                   wrapped by FormSystemOperator so they act on true-dofs.
+//                   The returned BlockOperator holds unscaled F'_* in its
+//                   slots — the stage op applies γ when composing with M+γK.
+class RogersRicciReactionOp : public Operator
 {
 public:
+   RogersRicciReactionOp(ParFiniteElementSpace &fes,
+                         const QuadratureSpace &qspace,
+                         const IntegrationRule &ir,
+                         const Array<int> &block_offsets,
+                         const QuadratureFunction &phi_qf,
+                         const QuadratureFunction &Sn_qf,
+                         int num_active,
+                         real_t Lambda,
+                         real_t eps2);
 
-   RogersRicciNLFIntegrator(Coefficient &phi,
-                          Coefficient &Sn,
-                          int num_active = NUM_VARS,
-                          real_t Lambda = 3.0,
-                          real_t eps2 = 1e-4)
-      : _phi(&phi), _Sn(&Sn),
-        _Lambda(Lambda), _eps2(eps2),
-        _num_active(num_active)
-   {
-      MFEM_VERIFY(num_active >= 1 && num_active <= NUM_VARS,
-                  "RogersRicciNLFIntegrator: num_active out of range.");
-   }
-
-   // Residual contribution to each block:
-   //   elvec[T_IDX]     += integral of F_T(T, phi) * shape
-   //   elvec[OMEGA_IDX] += integral of F_omega(T, phi) * shape
-   //   elvec[N_IDX]     += integral of F_n(n, T, phi) * shape
-   void AssembleElementVector(const Array<const FiniteElement*> &el,
-                              ElementTransformation &Tr,
-                              const Array<const Vector*> &elfun,
-                              const Array<Vector*> &elvec) override;
-
-   // Jacobian (state-derivative of the residual).  Non-zero blocks:
-   //   (T,T)     dF_T/dT
-   //   (omega,T) dF_omega/dT
-   //   (n,T)     dF_n/dT
-   //   (n,n)     dF_n/dn
-   // All others are explicitly zeroed.
-   void AssembleElementGrad(const Array<const FiniteElement*> &el,
-                            ElementTransformation &Tr,
-                            const Array<const Vector*> &elfun,
-                            const Array2D<DenseMatrix*> &elmats) override;
+   void Mult(const Vector &z_true, Vector &R_true) const override;
+   // Covariant return — base class returns Operator&; the caller can
+   // address blocks directly without an explicit dynamic_cast.
+   BlockOperator &GetGradient(const Vector &z_true) const override;
 
 private:
-   Coefficient *_phi;
-   Coefficient *_Sn;
-   real_t _Lambda;
-   real_t _eps2;
-   int    _num_active;
+   void sampleStateToQPs(const Vector &z_true) const;
+   void computeReactionResidualAtQPs() const;
+   void computeReactionJacobianAtQPs() const;
+
+   ParFiniteElementSpace            &_fes;
+   const QuadratureSpace            &_qspace;
+   const IntegrationRule            &_ir;
+   const Array<int>                 &_block_offsets;
+   const QuadratureFunction         *_phi_qf;
+   const QuadratureFunction         *_Sn_qf;
+   int      _num_active;
+   real_t   _Lambda, _eps2;
+
+   // Cached, FES-owned, device-aware.
+   const ElementRestrictionOperator *_er;
+   const QuadratureInterpolator     *_qi;
+
+   // QPs samples of the state.  T always populated; n only when num_active>=3.
+   mutable QuadratureFunction _T_qf, _n_qf;
+
+   // Per-QP residual contributions (vdim=1 each, on _qspace).
+   mutable QuadratureFunction _F_T_qf, _F_omega_qf, _F_n_qf;
+   mutable QuadratureFunctionCoefficient _F_T_qfc, _F_omega_qfc, _F_n_qfc;
+
+   // Per-QP Jacobian entries.
+   mutable QuadratureFunction _dFT_dT_qf, _dFw_dT_qf, _dFn_dT_qf, _dFn_dn_qf;
+   mutable QuadratureFunctionCoefficient _dFT_dT_qfc, _dFw_dT_qfc,
+                                          _dFn_dT_qfc, _dFn_dn_qfc;
+
+   // Scratch L- and E-vectors (allocated once, reused).
+   mutable Vector _l_vec_T, _l_vec_n;
+   mutable Vector _e_vec_T, _e_vec_n;
+
+   // Residual assembly via DomainLFIntegrator(QFC) (device path).
+   mutable std::unique_ptr<ParLinearForm> _lf_T, _lf_omega, _lf_n;
+
+   // Jacobian: MassIntegrator(QFC) with AssemblyLevel::PARTIAL.  Output is
+   // an L-vector-acting PA op wrapped by FormSystemOperator into a true-dof
+   // acting Operator.
+   mutable std::unique_ptr<ParBilinearForm> _bf_TT, _bf_wT, _bf_nT, _bf_nn;
+   mutable OperatorHandle                   _J_TT, _J_wT, _J_nT, _J_nn;
+
+   // Persistent 3x3 BlockOperator returned by GetGradient (holds unscaled
+   // F'_* operators; the stage op applies γ and composes with M+γK).
+   mutable BlockOperator _F_block;
 };
 
 // Owns the mesh, the H1 ParFiniteElementSpace shared by the three
@@ -93,7 +129,7 @@ public:
 
    const Array<int>      &BlockTrueOffsets() const { return _block_trueOffsets; }
    ParFiniteElementSpace *H1FES()             const { return _h1_fes.get();     }
-   ParBlockNonlinearForm *FForm()             const { return _F_form.get();     }
+   RogersRicciReactionOp *ReactionOp()        const { return _reaction_op.get(); }
    HypreParMatrix        *MassMat()           const { return _M_mat.get();      }
    HypreParMatrix        *KMat()              const { return _K_mat.get();      }
    ParGridFunction       *Phi()               const { return _phi.get();        }
@@ -176,7 +212,14 @@ private:
    std::unique_ptr<QuadratureFunctionCoefficient>       _phi_qfc;
    std::unique_ptr<QuadratureFunctionCoefficient>       _Sn_qfc;
 
-   std::unique_ptr<ParBlockNonlinearForm>               _F_form;
+   // Cached pointers + scratch E-vector for the device-friendly phi → QP
+   // pipeline used by projectPhiToQuadrature.  Both pointers are FES-owned;
+   // we don't free them.  The E-vector is sized to _er_h1->Height().
+   const ElementRestrictionOperator                    *_er_h1 = nullptr;
+   const QuadratureInterpolator                        *_qi_h1 = nullptr;
+   Vector                                               _phi_e_vec;
+
+   std::unique_ptr<RogersRicciReactionOp>               _reaction_op;
 
    std::unique_ptr<ParaViewDataCollection>              _dc;
 };
@@ -211,11 +254,21 @@ private:
    mutable Vector                   _tmp_block;
 
    mutable BlockOperator                   _Jac_block;
-   mutable std::unique_ptr<HypreParMatrix> _M_plus_gK;
-   mutable std::unique_ptr<HypreParMatrix> _diag_T;
-   mutable std::unique_ptr<HypreParMatrix> _diag_n;    
-   mutable std::unique_ptr<HypreParMatrix> _gFwT;      
-   mutable std::unique_ptr<HypreParMatrix> _gFnT;      
+   mutable std::unique_ptr<HypreParMatrix> _M_plus_gK;   // built per stage
+
+   // Per-Newton-iter composition wrappers (cheap, no SpMV):
+   //   off-diagonals: γ·F'_{ω,T}, γ·F'_{n,T}
+   //   diagonals:     (M+γK) ⊕ γ·F'_{T,T},  (M+γK) ⊕ γ·F'_{n,n}
+   mutable std::unique_ptr<ScaledOperator> _gFwT;
+   mutable std::unique_ptr<ScaledOperator> _gFnT;
+   mutable std::unique_ptr<SumOperator>    _diag_T;
+   mutable std::unique_ptr<SumOperator>    _diag_n;
+
+public:
+   // Exposed so the linear solver can pin AMG hierarchies to the static
+   // (M + γK) operand once per implicit stage instead of re-doing AMG
+   // setup every Newton iter.
+   HypreParMatrix *MassPlusGammaK() const { return _M_plus_gK.get(); }
 };
 
 // TimeDependentOperator that the ODESolver drives.
@@ -246,4 +299,4 @@ private:
    std::unique_ptr<IterativeSolver> _lin_solver;
 };
 
-#endif // MFEM_EX42P_HPP
+#endif // MFEM_EX43P_HPP

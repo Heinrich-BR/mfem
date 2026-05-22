@@ -1,130 +1,263 @@
-#include "ex42p.hpp"
+#include "ex43p.hpp"
 
-void RogersRicciNLFIntegrator::AssembleElementVector(
-   const Array<const FiniteElement*> &el,
-   ElementTransformation &Tr,
-   const Array<const Vector*> &elfun,
-   const Array<Vector*> &elvec)
+// ===========================================================================
+//                   RogersRicciReactionOp implementation
+// ===========================================================================
+
+RogersRicciReactionOp::RogersRicciReactionOp(
+   ParFiniteElementSpace &fes,
+   const QuadratureSpace &qspace,
+   const IntegrationRule &ir,
+   const Array<int> &block_offsets,
+   const QuadratureFunction &phi_qf,
+   const QuadratureFunction &Sn_qf,
+   int num_active,
+   real_t Lambda,
+   real_t eps2)
+   : Operator(block_offsets.Last()),
+     _fes(fes),
+     _qspace(qspace),
+     _ir(ir),
+     _block_offsets(block_offsets),
+     _phi_qf(&phi_qf),
+     _Sn_qf(&Sn_qf),
+     _num_active(num_active),
+     _Lambda(Lambda),
+     _eps2(eps2),
+     _er(fes.GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC)),
+     _qi(fes.GetQuadratureInterpolator(ir)),
+     _T_qf(const_cast<QuadratureSpace&>(qspace)),
+     _n_qf(const_cast<QuadratureSpace&>(qspace)),
+     _F_T_qf(const_cast<QuadratureSpace&>(qspace)),
+     _F_omega_qf(const_cast<QuadratureSpace&>(qspace)),
+     _F_n_qf(const_cast<QuadratureSpace&>(qspace)),
+     _F_T_qfc(_F_T_qf),
+     _F_omega_qfc(_F_omega_qf),
+     _F_n_qfc(_F_n_qf),
+     _dFT_dT_qf(const_cast<QuadratureSpace&>(qspace)),
+     _dFw_dT_qf(const_cast<QuadratureSpace&>(qspace)),
+     _dFn_dT_qf(const_cast<QuadratureSpace&>(qspace)),
+     _dFn_dn_qf(const_cast<QuadratureSpace&>(qspace)),
+     _dFT_dT_qfc(_dFT_dT_qf),
+     _dFw_dT_qfc(_dFw_dT_qf),
+     _dFn_dT_qfc(_dFn_dT_qf),
+     _dFn_dn_qfc(_dFn_dn_qf),
+     _F_block(block_offsets)
 {
-   MFEM_VERIFY(el.Size() == NUM_VARS,
-               "RogersRicciNLFIntegrator expects exactly "
-               << NUM_VARS << " FE spaces.");
-   const int dof = el[0]->GetDof();
+   // Use byNODES (default) — vdim=1 throughout so layout is trivial.
 
-   Vector shape(dof);
-   for (int s = 0; s < NUM_VARS; ++s)
+   // Scratch L- and E-vectors, device-aware.
+   _l_vec_T.SetSize(fes.GetVSize());     _l_vec_T.UseDevice(true);
+   _l_vec_n.SetSize(fes.GetVSize());     _l_vec_n.UseDevice(true);
+   _e_vec_T.SetSize(_er->Height());      _e_vec_T.UseDevice(true);
+   _e_vec_n.SetSize(_er->Height());      _e_vec_n.UseDevice(true);
+
+   // Residual assembly: one ParLinearForm per variable, each driven by a
+   // QuadratureFunctionCoefficient backed by our F_*_qf buffers.  The
+   // DomainLFIntegrator(QFC) takes the DLFEvalAssemble device path when
+   // Device("cuda") is active.
+   auto make_lf = [&](QuadratureFunctionCoefficient &qfc)
    {
-      elvec[s]->SetSize(dof);
-      *elvec[s] = 0.0;
+      auto lf = std::make_unique<ParLinearForm>(&fes);
+      auto *integ = new DomainLFIntegrator(qfc);
+      integ->SetIntRule(&ir);
+      lf->AddDomainIntegrator(integ);
+      return lf;
+   };
+   _lf_T     = make_lf(_F_T_qfc);
+   _lf_omega = make_lf(_F_omega_qfc);
+   _lf_n     = make_lf(_F_n_qfc);
+
+   // Jacobian assembly: one ParBilinearForm per non-zero F' block, PA mode.
+   // MassIntegrator(QFC) with COMPRESSED CoefficientVector storage reads QF
+   // data by reference (no copy) and runs AssemblePA on device.
+   auto make_bf = [&](QuadratureFunctionCoefficient &qfc)
+   {
+      auto bf = std::make_unique<ParBilinearForm>(&fes);
+      auto *integ = new MassIntegrator(qfc);
+      integ->SetIntRule(&ir);
+      bf->AddDomainIntegrator(integ);
+      bf->SetAssemblyLevel(AssemblyLevel::PARTIAL);
+      return bf;
+   };
+   _bf_TT = make_bf(_dFT_dT_qfc);
+   _bf_wT = make_bf(_dFw_dT_qfc);
+   _bf_nT = make_bf(_dFn_dT_qfc);
+   _bf_nn = make_bf(_dFn_dn_qfc);
+}
+
+void RogersRicciReactionOp::Mult(const Vector &z_true, Vector &R_true) const
+{
+   // (a) Sample z at QPs (device): true -> L -> E -> Q for T and n.
+   sampleStateToQPs(z_true);
+
+   // (b) Per-QP kernel (device): compute F_T, F_omega, F_n into QF buffers.
+   computeReactionResidualAtQPs();
+
+   // (c) Assemble residual blocks via DomainLFIntegrator(QFC).  When Device
+   //     is "cuda", ParLinearForm::Assemble takes the DLFEvalAssemble path
+   //     which runs on device and reads coefficient data from QF directly.
+   _lf_T->Assemble();
+   if (_num_active >= 2) { _lf_omega->Assemble(); }
+   if (_num_active >= 3) { _lf_n->Assemble(); }
+
+   // (d) ParallelAssemble each LF into the appropriate true-dof block of R.
+   //     Frozen rows get a clean zero so Newton's M·k_s = 0 equation drives
+   //     k_s to zero (matching the ex42p behaviour).
+   BlockVector R_blk(R_true, _block_offsets);
+   _lf_T->ParallelAssemble(R_blk.GetBlock(T_IDX));
+   if (_num_active >= 2)
+   {
+      _lf_omega->ParallelAssemble(R_blk.GetBlock(OMEGA_IDX));
    }
-
-   // Single H1 space across blocks → same geometry/order on every block.
-   // 2*p + 3 is the order used by IncompressibleNeoHookeanIntegrator and is
-   // generous enough for the exponential coupling here.
-   const IntegrationRule &ir =
-      IntRules.Get(el[0]->GetGeomType(), 2 * el[0]->GetOrder() + 3);
-
-   for (int q = 0; q < ir.GetNPoints(); ++q)
+   else
    {
-      const IntegrationPoint &ip = ir.IntPoint(q);
-      Tr.SetIntPoint(&ip);
-      el[0]->CalcShape(ip, shape);
-
-      // omega does not appear in any F_x (PDF eq. 7), so we never read
-      // elfun[OMEGA_IDX] here — F_omega depends on T and phi only.
-      const real_t T = shape * (*elfun[T_IDX]);
-      const real_t n = shape * (*elfun[N_IDX]);
-
-      const real_t phi = _phi->Eval(Tr, ip);
-      const real_t Sn  = _Sn->Eval(Tr, ip);
-
-      // Regularisation: replace 1/T by 1/Treg with Treg = sqrt(T^2 + eps2).
-      // The Jacobian below uses the chain-rule derivative consistent with
-      // this regularisation, so Newton convergence is unaffected.
-      const real_t Treg = std::sqrt(T*T + _eps2);
-      const real_t A    = _Lambda - phi / Treg;
-      const real_t eA   = std::exp(A);
-
-      const real_t F_T = (T / 36.0) * (1.71 * eA - 0.71) - Sn;
-      const real_t F_w = (eA - 1.0) / 24.0;
-      const real_t F_n = (n / 24.0) * eA - Sn;
-
-      const real_t w = ip.weight * Tr.Weight();
-
-      // Always evolve T; omega and n only if their rows are active.
-      // Frozen rows stay at zero residual contribution → Newton sees only
-      // M*k_s, which drives k_s to 0 and leaves the predictor state intact.
-      elvec[T_IDX]->Add(w * F_T, shape);
-      if (_num_active >= 2) { elvec[OMEGA_IDX]->Add(w * F_w, shape); }
-      if (_num_active >= 3) { elvec[N_IDX]    ->Add(w * F_n, shape); }
+      R_blk.GetBlock(OMEGA_IDX) = 0.0;
+   }
+   if (_num_active >= 3)
+   {
+      _lf_n->ParallelAssemble(R_blk.GetBlock(N_IDX));
+   }
+   else
+   {
+      R_blk.GetBlock(N_IDX) = 0.0;
    }
 }
 
-void RogersRicciNLFIntegrator::AssembleElementGrad(
-   const Array<const FiniteElement*> &el,
-   ElementTransformation &Tr,
-   const Array<const Vector*> &elfun,
-   const Array2D<DenseMatrix*> &elmats)
+BlockOperator &RogersRicciReactionOp::GetGradient(const Vector &z_true) const
 {
-   MFEM_VERIFY(el.Size() == NUM_VARS,
-               "RogersRicciNLFIntegrator expects exactly "
-               << NUM_VARS << " FE spaces.");
-   const int dof = el[0]->GetDof();
+   // (a) Sample z at QPs (device): true -> L -> E -> Q for T and n.
+   sampleStateToQPs(z_true);
 
-   Vector shape(dof);
-   for (int s = 0; s < NUM_VARS; ++s)
+   // (b) Per-QP kernel (device): write the four dF/du QFs.
+   computeReactionJacobianAtQPs();
+
+   // (c) Re-assemble each PA bilinear form.  MassIntegrator's pa_data
+   //     caches the per-QP weighted coefficient values, so when the
+   //     underlying QF changes we must drop the cache and recompute via
+   //     AssemblePA.  FormSystemMatrix wraps the L-vector-acting PA
+   //     operator with P^T … P so it acts on true-dofs (returns an
+   //     OperatorHandle around a non-owning ConstrainedOperator).
+   Array<int> empty_ess;
+   auto rebuild = [&](ParBilinearForm &bf, OperatorHandle &out)
    {
-      for (int t = 0; t < NUM_VARS; ++t)
-      {
-         elmats(s, t)->SetSize(dof, dof);
-         *elmats(s, t) = 0.0;
-      }
+      bf.Update();
+      bf.Assemble();
+      bf.FormSystemMatrix(empty_ess, out);
+   };
+
+   rebuild(*_bf_TT, _J_TT);
+   _F_block.SetBlock(T_IDX, T_IDX, _J_TT.Ptr());
+
+   if (_num_active >= 2)
+   {
+      rebuild(*_bf_wT, _J_wT);
+      _F_block.SetBlock(OMEGA_IDX, T_IDX, _J_wT.Ptr());
+   }
+   if (_num_active >= 3)
+   {
+      rebuild(*_bf_nT, _J_nT);
+      _F_block.SetBlock(N_IDX, T_IDX, _J_nT.Ptr());
+      rebuild(*_bf_nn, _J_nn);
+      _F_block.SetBlock(N_IDX, N_IDX, _J_nn.Ptr());
    }
 
-   const IntegrationRule &ir =
-      IntRules.Get(el[0]->GetGeomType(), 2 * el[0]->GetOrder() + 3);
+   // The returned BlockOperator carries *unscaled* F'_* operators in its
+   // slots — the stage operator applies γ when composing with M + γK.
+   return _F_block;
+}
 
-   for (int q = 0; q < ir.GetNPoints(); ++q)
+void RogersRicciReactionOp::sampleStateToQPs(const Vector &z_true) const
+{
+   // View the flat true-dof vector block-wise so we can sample variable by
+   // variable.  This is a non-owning const_cast (same idiom as MFEM's
+   // BlockOperator::Mult) — we only read.
+   BlockVector z_blk(const_cast<Vector&>(z_true), _block_offsets);
+
+   const Operator *P = _fes.GetProlongationMatrix();
+
+   // T pipeline: true -> L (Prolongation) -> E (ElementRestriction) ->
+   //             Q (QuadratureInterpolator::Values), all device-native.
+   P->Mult(z_blk.GetBlock(T_IDX), _l_vec_T);
+   _er->Mult(_l_vec_T, _e_vec_T);
+   _qi->Values(_e_vec_T, _T_qf);
+
+   // n pipeline (always — when num_active < 3 the value comes out frozen at
+   // its IC anyway, since Newton drives k_n to zero; resampling is one extra
+   // O(nDOFs) call per residual eval — cheap, keeps the kernel branchless).
+   P->Mult(z_blk.GetBlock(N_IDX), _l_vec_n);
+   _er->Mult(_l_vec_n, _e_vec_n);
+   _qi->Values(_e_vec_n, _n_qf);
+}
+
+void RogersRicciReactionOp::computeReactionResidualAtQPs() const
+{
+   const int nq = _qspace.GetSize();
+
+   const real_t *T_ptr   = _T_qf.Read();
+   const real_t *n_ptr   = _n_qf.Read();
+   const real_t *phi_ptr = _phi_qf->Read();
+   const real_t *Sn_ptr  = _Sn_qf->Read();
+
+   real_t *FT_ptr = _F_T_qf.Write();
+   real_t *Fw_ptr = _F_omega_qf.Write();
+   real_t *Fn_ptr = _F_n_qf.Write();
+
+   const real_t Lambda = _Lambda;
+   const real_t eps2   = _eps2;
+
+   mfem::forall(nq, [=] MFEM_HOST_DEVICE (int q)
    {
-      const IntegrationPoint &ip = ir.IntPoint(q);
-      Tr.SetIntPoint(&ip);
-      el[0]->CalcShape(ip, shape);
+      const real_t T   = T_ptr[q];
+      const real_t n   = n_ptr[q];
+      const real_t phi = phi_ptr[q];
+      const real_t Sn  = Sn_ptr[q];
 
-      const real_t T = shape * (*elfun[T_IDX]);
-      const real_t n = shape * (*elfun[N_IDX]);
+      const real_t Treg = sqrt(T*T + eps2);
+      const real_t A    = Lambda - phi / Treg;
+      const real_t eA   = exp(A);
 
-      const real_t phi  = _phi->Eval(Tr, ip);
-      const real_t Treg = std::sqrt(T*T + _eps2);
-      const real_t A    = _Lambda - phi / Treg;
-      const real_t eA   = std::exp(A);
+      FT_ptr[q] = (T / 36.0) * (1.71 * eA - 0.71) - Sn;
+      Fw_ptr[q] = (eA - 1.0) / 24.0;
+      Fn_ptr[q] = (n / 24.0) * eA - Sn;
+   });
+}
 
-      // d(1/Treg)/dT = -T/Treg^3   ⇒   dA/dT = phi*T/Treg^3.
-      // For T >> sqrt(eps2) this collapses to PDF eq. 8's phi/T^2 form;
-      // near T == 0 it stays bounded, unlike the bare PDF formula.
-      const real_t Treg3  = Treg * Treg * Treg;
+void RogersRicciReactionOp::computeReactionJacobianAtQPs() const
+{
+   const int nq = _qspace.GetSize();
+
+   const real_t *T_ptr   = _T_qf.Read();
+   const real_t *n_ptr   = _n_qf.Read();
+   const real_t *phi_ptr = _phi_qf->Read();
+
+   real_t *dFT_dT_ptr = _dFT_dT_qf.Write();
+   real_t *dFw_dT_ptr = _dFw_dT_qf.Write();
+   real_t *dFn_dT_ptr = _dFn_dT_qf.Write();
+   real_t *dFn_dn_ptr = _dFn_dn_qf.Write();
+
+   const real_t Lambda = _Lambda;
+   const real_t eps2   = _eps2;
+
+   mfem::forall(nq, [=] MFEM_HOST_DEVICE (int q)
+   {
+      const real_t T   = T_ptr[q];
+      const real_t n   = n_ptr[q];
+      const real_t phi = phi_ptr[q];
+
+      const real_t Treg  = sqrt(T*T + eps2);
+      const real_t A     = Lambda - phi / Treg;
+      const real_t eA    = exp(A);
+      const real_t Treg3 = Treg * Treg * Treg;
+      // dA/dT = phi*T/Treg^3 (chain rule on Treg).
       const real_t deA_dT = eA * phi * T / Treg3;
 
-      // dF_T/dT = (1.71 eA - 0.71)/36 + (T/36)·1.71·dE/dT
-      const real_t dFT_dT = (1.71 * eA - 0.71) / 36.0
-                            + (T * 1.71 / 36.0) * deA_dT;
-      const real_t dFw_dT = deA_dT / 24.0;
-      const real_t dFn_dT = n * deA_dT / 24.0;
-      const real_t dFn_dn = eA / 24.0;
-
-      const real_t w = ip.weight * Tr.Weight();
-
-      // Same gating as the residual: only contribute to active-row blocks.
-      AddMult_a_VVt(w * dFT_dT, shape, *elmats(T_IDX, T_IDX));
-      if (_num_active >= 2)
-      {
-         AddMult_a_VVt(w * dFw_dT, shape, *elmats(OMEGA_IDX, T_IDX));
-      }
-      if (_num_active >= 3)
-      {
-         AddMult_a_VVt(w * dFn_dT, shape, *elmats(N_IDX, T_IDX));
-         AddMult_a_VVt(w * dFn_dn, shape, *elmats(N_IDX, N_IDX));
-      }
-   }
+      dFT_dT_ptr[q] = (1.71 * eA - 0.71) / 36.0
+                      + (T * 1.71 / 36.0) * deA_dT;
+      dFw_dT_ptr[q] = deA_dT / 24.0;
+      dFn_dT_ptr[q] = n * deA_dT / 24.0;
+      dFn_dn_ptr[q] = eA / 24.0;
+   });
 }
 
 Ricci2DNonlinear::Ricci2DNonlinear(MPI_Comm comm, int order, int ref_levels,
@@ -271,11 +404,20 @@ void Ricci2DNonlinear::buildQuadratureSamples()
    _Sn_qf = std::make_unique<QuadratureFunction>(*_qspace);
    _phi_qfc = std::make_unique<QuadratureFunctionCoefficient>(*_phi_qf);
    _Sn_qfc = std::make_unique<QuadratureFunctionCoefficient>(*_Sn_qf);
+
+   // Cache the FES-owned device-friendly pipeline for projectPhiToQuadrature.
+   _er_h1 = _h1_fes->GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC);
+   _qi_h1 = _h1_fes->GetQuadratureInterpolator(_qspace->GetIntRule(0));
+   _phi_e_vec.SetSize(_er_h1->Height());
+   _phi_e_vec.UseDevice(true);
 }
 
 void Ricci2DNonlinear::projectPhiToQuadrature()
 {
-   _phi_qf->ProjectGridFunction(*_phi);
+   // Device-friendly: L (phi GridFunction is already an L-vector) -> E -> Q.
+   // Replaces the host-only QuadratureFunction::ProjectGridFunction path.
+   _er_h1->Mult(*_phi, _phi_e_vec);
+   _qi_h1->Values(_phi_e_vec, *_phi_qf);
 }
 
 void Ricci2DNonlinear::buildMassMatrix()
@@ -330,15 +472,12 @@ void Ricci2DNonlinear::buildPhiSolver()
 
 void Ricci2DNonlinear::buildNonlinearForm()
 {
-   Array<ParFiniteElementSpace*> fes(NUM_VARS);
-
-   for (int i = 0; i < NUM_VARS; ++i) 
-      fes[i] = _h1_fes.get();
-
-   _F_form = std::make_unique<ParBlockNonlinearForm>(fes);
-   _F_form->AddDomainIntegrator(
-      new RogersRicciNLFIntegrator(*_phi_qfc, *_Sn_qfc, _num_active,
-                                 _Lambda, _eps2));
+   // Device-native nonlinear reaction operator.  Replaces the host-only
+   // RogersRicciNLFIntegrator + ParBlockNonlinearForm used by ex42p.
+   _reaction_op = std::make_unique<RogersRicciReactionOp>(
+      *_h1_fes, *_qspace, _qspace->GetIntRule(0),
+      _block_trueOffsets, *_phi_qf, *_Sn_qf,
+      _num_active, _Lambda, _eps2);
 }
 
 void Ricci2DNonlinear::setInitialConditions()
@@ -578,11 +717,8 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
 
    add(*_u_pred, _gamma, k_vec, _z);
 
-   _z.HostRead();
-   R_vec.HostWrite(); // overwrite on host
-   _ricci.FForm()->Mult(_z, R_vec);
-   R_vec.ReadWrite(); // host-device sync
-
+   // Device-native reaction op.
+   _ricci.ReactionOp()->Mult(_z, R_vec);
 
    // R += M·k + K·z, applied block-by-block.  M and K are single-block H1
    // operators replicated on the diagonal of the (otherwise zero-coupled in
@@ -611,31 +747,38 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
    // z = u_pred + gamma * k.
    add(*_u_pred, _gamma, k_vec, _z);
 
-   // F's 3x3 block gradient at z.  The integrator gates this on num_active
-   // — frozen rows produce no contribution.  Non-zero blocks (fully active)
-   // are (T,T), (omega,T), (n,T), (n,n).
-   BlockOperator &Fgrad = _ricci.FForm()->GetGradient(_z);
-   auto Fblock = [&](int i, int j) -> HypreParMatrix &
-   {
-      return dynamic_cast<HypreParMatrix &>(Fgrad.GetBlock(i, j));
-   };
+   // PA F'_* blocks (unscaled), all on device — no HypreParMatrix
+   // construction.
+   BlockOperator &Fgrad = _ricci.ReactionOp()->GetGradient(_z);
 
    const int       n_active = _ricci.NumActive();
-   HypreParMatrix *M = _ricci.MassMat();
+   HypreParMatrix *M        = _ricci.MassMat();
+   HypreParMatrix *MgK      = _M_plus_gK.get();   // built in SetParameters
 
-   // T row is always active.  M + gamma*K is precomputed in SetParameters.
-   _diag_T.reset(Add(1.0, *_M_plus_gK, _gamma, Fblock(T_IDX, T_IDX)));
+   // Compose the Jacobian block-by-block.  Diagonals: (M+γK) ⊕ γ·F'_*.
+   // Off-diagonals: γ·F'_*.  The SumOperator / ScaledOperator wrappers
+   // hold pointers (no SpMV at construction time) — actual matrix-vector
+   // applies happen inside GMRES.  Operands stay alive across Newton
+   // iters because the underlying PA forms persist in RogersRicciReactionOp.
+
+   // T row is always active.
+   _diag_T = std::make_unique<SumOperator>(MgK, 1.0,
+                                            &Fgrad.GetBlock(T_IDX, T_IDX),
+                                            _gamma,
+                                            /*ownA=*/false, /*ownB=*/false);
    _Jac_block.SetDiagonalBlock(T_IDX, _diag_T.get());
 
-   // omega row: M + gamma*K if active (F'_omega,omega = 0), bare M if frozen
-   // so Newton drives k_omega to 0.
+   // omega row: M + γK if active (F'_{ω,ω} = 0), bare M if frozen.
    _Jac_block.SetDiagonalBlock(OMEGA_IDX,
-                               (n_active >= 2) ? _M_plus_gK.get() : M);
+                               (n_active >= 2) ? MgK : M);
 
-   // n row: M + gamma*K + gamma*F'_{n,n} if active, bare M if frozen.
+   // n row: (M+γK) ⊕ γ·F'_{n,n} if active, bare M if frozen.
    if (n_active >= 3)
    {
-      _diag_n.reset(Add(1.0, *_M_plus_gK, _gamma, Fblock(N_IDX, N_IDX)));
+      _diag_n = std::make_unique<SumOperator>(MgK, 1.0,
+                                               &Fgrad.GetBlock(N_IDX, N_IDX),
+                                               _gamma,
+                                               false, false);
       _Jac_block.SetDiagonalBlock(N_IDX, _diag_n.get());
    }
    else
@@ -644,18 +787,17 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
       _Jac_block.SetDiagonalBlock(N_IDX, M);
    }
 
-   // Off-diagonals: gamma * F'_{omega,T} and gamma * F'_{n,T}.
-   // Add(0, X, gamma, X) yields a fresh gamma*X HypreParMatrix.
+   // Off-diagonals: γ·F'_{ω,T}, γ·F'_{n,T}.
    if (n_active >= 2)
    {
-      _gFwT.reset(Add(0.0, Fblock(OMEGA_IDX, T_IDX),
-                      _gamma, Fblock(OMEGA_IDX, T_IDX)));
+      _gFwT = std::make_unique<ScaledOperator>(
+         &Fgrad.GetBlock(OMEGA_IDX, T_IDX), _gamma);
       _Jac_block.SetBlock(OMEGA_IDX, T_IDX, _gFwT.get());
    }
    if (n_active >= 3)
    {
-      _gFnT.reset(Add(0.0, Fblock(N_IDX, T_IDX),
-                      _gamma, Fblock(N_IDX, T_IDX)));
+      _gFnT = std::make_unique<ScaledOperator>(
+         &Fgrad.GetBlock(N_IDX, T_IDX), _gamma);
       _Jac_block.SetBlock(N_IDX, T_IDX, _gFnT.get());
    }
 
@@ -725,16 +867,30 @@ public:
       }
    }
 
+   // Called once per implicit stage (before Newton begins).  Configures the
+   // AMG hierarchies on the static (M + γK) operand — these are valid for
+   // the whole stage because M + γK doesn't depend on the Newton iterate.
+   // Saves a redundant AMG setup per Newton iter.
+   void SetPrecondOperands(HypreParMatrix &M,
+                           HypreParMatrix &M_plus_gK,
+                           int num_active)
+   {
+      // T row is always active.
+      _amgs[T_IDX]->SetOperator(M_plus_gK);
+      _amgs[OMEGA_IDX]->SetOperator((num_active >= 2) ? M_plus_gK : M);
+      _amgs[N_IDX]->SetOperator((num_active >= 3) ? M_plus_gK : M);
+   }
+
+   // Per-Newton-iter: only updates GMRES's system operator.  Does NOT
+   // re-setup AMG (its operand M+γK is constant for the whole stage and
+   // was pinned by SetPrecondOperands).  Builds the BDP on first call,
+   // now that we know the offsets.
    void SetOperator(const Operator &op) override
    {
       const BlockOperator *bop = dynamic_cast<const BlockOperator*>(&op);
       MFEM_VERIFY(bop != nullptr,
                   "BlockNewtonLinearSolver: expected a BlockOperator from "
                   "RicciImplicitStageOp::GetGradient().");
-
-      for (int s = 0; s < NUM_VARS; ++s)
-         _amgs[s]->SetOperator(
-            dynamic_cast<const HypreParMatrix&>(bop->GetBlock(s, s)));
 
       if (!_bdp)
       {
@@ -753,7 +909,7 @@ public:
 
    void Mult(const Vector &b, Vector &x) const override
    {
-      // Propagate adaptive rtol set by NewtonSolver since the last call. 
+      // Propagate adaptive rtol set by NewtonSolver since the last call.
       _gmres.SetRelTol(rel_tol);
       _gmres.SetAbsTol(abs_tol);
       _gmres.SetMaxIter(max_iter);
@@ -809,6 +965,18 @@ void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
 
    // Set up M + γK
    _stage_op.SetParameters(gamma, u_pred_blk);
+
+   // Pin the linear solver's AMG hierarchies to the static M+γK operand —
+   // once per stage, not once per Newton iter.  Saves redundant AMG setup
+   // calls (M+γK doesn't depend on the Newton iterate).
+   auto *block_solver =
+      dynamic_cast<BlockNewtonLinearSolver*>(_lin_solver.get());
+   MFEM_VERIFY(block_solver,
+               "RicciTimeOperator: linear solver is not a "
+               "BlockNewtonLinearSolver.");
+   block_solver->SetPrecondOperands(*_ricci.MassMat(),
+                                     *_stage_op.MassPlusGammaK(),
+                                     _ricci.NumActive());
 
    k = 0.0;
    Vector zero;
