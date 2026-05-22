@@ -566,9 +566,6 @@ void RicciImplicitStageOp::SetParameters(real_t gamma, const BlockVector &u_pred
    _gamma = gamma;
    _u_pred = &u_pred;
 
-   // The M + gamma*K block is shared across every Newton iter of this stage
-   // and across every variable row.  Build it once here so GetGradient only
-   // has to fold in the reaction contribution F'_ss.
    HypreParMatrix *M = _ricci.MassMat();
    HypreParMatrix *K = _ricci.KMat();
    _M_plus_gK.reset(Add(1.0, *M, _gamma, *K));
@@ -579,10 +576,8 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    MFEM_VERIFY(_u_pred != nullptr,
                "RicciImplicitStageOp: SetParameters() not called before Mult().");
 
-   // z = u_pred + gamma * k.  (`_z` is a BlockVector so GetBlock(s) works.)
    add(*_u_pred, _gamma, k_vec, _z);
 
-   // R = F(z)   (each block s receives (F_s(z), test_s) from the integrator).
    _ricci.FForm()->Mult(_z, R_vec);
 
    // R += M·k + K·z, applied block-by-block.  M and K are single-block H1
@@ -678,7 +673,6 @@ public:
 
    // Armijo backtrack: find alpha in (0, 1] such that
    //     ||F(x - alpha c) - b|| <= (1 - sigma * alpha) ||F(x) - b||
-   // halving alpha each failed trial, up to max_tries.
    real_t ComputeScalingFactor(const Vector &x, const Vector &b) const override
    {
       const real_t norm0 = Norm(r);    // r is the residual at x, stored by Mult
@@ -698,27 +692,12 @@ public:
          if (norm_trial <= (1.0 - sigma * alpha) * norm0) { return alpha; }
          alpha *= 0.5;
       }
-      // Couldn't satisfy Armijo; return the smallest tried so Newton keeps
-      // making progress rather than aborting.  If this happens often, the
-      // outer time step is the real culprit.
+      // Couldn't satisfy Armijo; return the smallest tried
       return alpha;
    }
 };
 
-// Block-aware Krylov solver consumed by NewtonSolver as its linear solver.
-//
-// NewtonSolver hands us the Jacobian via SetOperator(op) and expects us to
-// solve J s = r on Mult(r, s).  We:
-//   - cast the operator down to BlockOperator (built by RicciImplicitStageOp),
-//   - extract its three diagonal HypreParMatrix blocks,
-//   - rebuild the per-variable AMG hierarchies that sit on the diagonal of a
-//     BlockDiagonalPreconditioner, and
-//   - call GMRES with the BlockOperator as the system operator and the
-//     block-diag preconditioner.
-//
-// Inherits from IterativeSolver so that NewtonSolver::SetAdaptiveLinRtol
-// (Eisenstat-Walker forcing) can call our SetRelTol — we override Mult to
-// forward the inherited rel_tol/abs_tol/max_iter to the internal GMRES.
+// Block Krylov solver consumed by NewtonSolver as its linear solver.
 class BlockNewtonLinearSolver : public IterativeSolver
 {
 public:
@@ -749,28 +728,17 @@ public:
                   "BlockNewtonLinearSolver: expected a BlockOperator from "
                   "RicciImplicitStageOp::GetGradient().");
 
-      // (Re)build each AMG on the matching diagonal HypreParMatrix first, so
-      // its height/width are valid before the block-diag preconditioner runs
-      // its dimension check in SetDiagonalBlock.  GetBlock is non-const on
-      // BlockOperator, so cast away const — we don't mutate.
-      BlockOperator &bopnc = const_cast<BlockOperator&>(*bop);
       for (int s = 0; s < NUM_VARS; ++s)
-      {
-         HypreParMatrix &diag = dynamic_cast<HypreParMatrix&>(
-                                   bopnc.GetBlock(s, s));
-         _amgs[s]->SetOperator(diag);
-      }
+         _amgs[s]->SetOperator(
+            dynamic_cast<const HypreParMatrix&>(bop->GetBlock(s, s)));
 
-      // Build the BDP lazily so we don't need the offsets in the ctor.
-      // The AMG pointers remain valid across Newton iters, so a single BDP
-      // suffices for the whole stage (and run).
       if (!_bdp)
       {
          _bdp = std::make_unique<BlockDiagonalPreconditioner>(bop->RowOffsets());
+
          for (int s = 0; s < NUM_VARS; ++s)
-         {
             _bdp->SetDiagonalBlock(s, _amgs[s].get());
-         }
+
          _gmres.SetPreconditioner(*_bdp);
       }
 
@@ -781,9 +749,7 @@ public:
 
    void Mult(const Vector &b, Vector &x) const override
    {
-      // Propagate any Eisenstat-Walker rtol set by NewtonSolver since the
-      // last call.  rel_tol / max_iter live on the IterativeSolver base; the
-      // internal GMRES has its own copies.
+      // Propagate adaptive rtol set by NewtonSolver since the last call. 
       _gmres.SetRelTol(rel_tol);
       _gmres.SetAbsTol(abs_tol);
       _gmres.SetMaxIter(max_iter);
@@ -791,10 +757,12 @@ public:
    }
 
 private:
+
    mutable GMRESSolver                          _gmres;
    std::unique_ptr<BlockDiagonalPreconditioner> _bdp;
    std::vector<std::unique_ptr<HypreBoomerAMG>> _amgs;
 };
+
 } // anonymous namespace
 
 RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear & ricci,
@@ -816,12 +784,7 @@ RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear & ricci,
    _newton->SetRelTol(newton_rtol);
    _newton->SetAbsTol(0.0);
    _newton->SetMaxIter(newton_max_iter);
-   _newton->SetPrintLevel(1);             // print Newton iterations per stage
-
-   // Eisenstat-Walker forcing is opt-in via EnableEisenstatWalker() (CLI: -ew).
-   // In this regime Newton usually converges in 1-2 iters per stage, so a
-   // tight fixed linear rtol (the default constructed above) is typically the
-   // right choice; EW pays off mostly when Newton chains get long.
+   _newton->SetPrintLevel(1);
 }
 
 void RicciTimeOperator::EnableEisenstatWalker(real_t rtol0, real_t rtol_max)
@@ -832,25 +795,17 @@ void RicciTimeOperator::EnableEisenstatWalker(real_t rtol0, real_t rtol_max)
 void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
                                       Vector &k)
 {
-   // The ODESolver hands us a flat true-dof Vector; view it block-wise so we
-   // can reach into the omega component for the phi solve and so the stage
-   // operator can do block-by-block arithmetic.
    BlockVector u_pred_blk(const_cast<Vector&>(u_pred),
                           _ricci.BlockTrueOffsets());
 
-   // (1) omega-from-predictor → (2) phi from Poisson → (3) refresh drift →
-   // (4) re-assemble K with the new vd → (5) resample phi at quadrature
-   // points for the reaction integrator's hot loop.
    _ricci.pullOmegaFromBlocks(u_pred_blk);
    _ricci.updatePhi();
-   _ricci.refreshDriftCoefs();
    _ricci.reassembleK();
    _ricci.projectPhiToQuadrature();
 
-   // (6) Wire up the stage equation R(k) = M k + K(u + γk) + F(u + γk).
+   // Set up M + γK
    _stage_op.SetParameters(gamma, u_pred_blk);
 
-   // (7) Newton drives R(k) = 0.  Empty `b` is interpreted as zero RHS.
    k = 0.0;
    Vector zero;
    _newton->Mult(zero, k);
@@ -1000,10 +955,6 @@ int main(int argc, char *argv[])
    std::unique_ptr<ODESolver> ode_solver = ODESolver::Select(ode_solver_type);
    ode_solver->Init(time_op);
 
-   // Tolerance for the loop termination check: stops a sub-machine-epsilon
-   // "phantom step" from firing at t_final due to floating-point
-   // accumulation in t (i.e. t < t_final is true by ~1e-18 but dt_step is
-   // essentially zero).
    const real_t t_tol = 1e-12 * std::max(t_final, dt);
    while (t < t_final - t_tol)
    {

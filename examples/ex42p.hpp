@@ -252,8 +252,7 @@ public:
    void ImplicitSolve(real_t gamma, const Vector &u_pred, Vector &k) override;
 
    // Turn on Eisenstat-Walker forcing so the inner Krylov tolerance loosens
-   // when Newton is far from convergence.  Useful when Newton typically takes
-   // many iterations per stage; usually unhelpful when it converges in 1-2.
+   // when Newton is far from convergence.
    void EnableEisenstatWalker(real_t rtol0 = 0.5, real_t rtol_max = 0.9);
 
 private:
