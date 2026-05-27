@@ -42,7 +42,6 @@ public:
    //   (omega,T) dF_omega/dT
    //   (n,T)     dF_n/dT
    //   (n,n)     dF_n/dn
-   // All others are explicitly zeroed.
    void AssembleElementGrad(const Array<const FiniteElement*> &el,
                             ElementTransformation &Tr,
                             const Array<const Vector*> &elfun,
@@ -92,13 +91,13 @@ public:
    void syncBlocksFromGridFuncs(BlockVector &u_blk) const;
 
    const Array<int>      &BlockTrueOffsets() const { return _block_trueOffsets; }
-   ParFiniteElementSpace *H1FES()             const { return _h1_fes.get();     }
-   ParBlockNonlinearForm *FForm()             const { return _F_form.get();     }
-   HypreParMatrix        *MassMat()           const { return _M_mat.get();      }
-   HypreParMatrix        *KMat()              const { return _K_mat.get();      }
-   ParGridFunction       *Phi()               const { return _phi.get();        }
-   BlockVector           *StateBlocks()       const { return _var_blocks.get(); }
-   int                    NumActive()         const { return _num_active;       }
+   ParFiniteElementSpace *H1FES() const { return _h1_fes.get(); }
+   ParBlockNonlinearForm *FForm() const { return _F_form.get(); }
+   HypreParMatrix        *MassMat() const { return _M_mat.get(); }
+   HypreParMatrix        *KMat() const { return _K_mat.get(); }
+   ParGridFunction       *Phi() const { return _phi.get(); }
+   BlockVector           *StateBlocks() const { return _var_blocks.get(); }
+   int                    NumActive() const { return _num_active; }
 
    real_t _xL, _yL;
    int    _order, _ref_levels;
@@ -183,13 +182,15 @@ private:
 
 // Residual + Jacobian wrapper consumed by NewtonSolver.
 //
-//     R(k) = M·k + K·(u_pred + γ·k) + F(u_pred + γ·k) = 0
+//     R(u') = M·u' + K·(u_pred + γ·u') + F(u_pred + γ·u') = 0
 //
-// for a stage derivative `k`, given the stage predictor `u_pred` and stage
-// step `γ` (= dt for backward Euler, = a_ii·dt for SDIRK).  NewtonSolver
-// calls Mult to get R and GetGradient to get
+// for a stage derivative `u'`, given the stage predictor `u_pred` and stage
+// step `γ` (= dt for backward Euler, = a_ii·dt for SDIRK). For Backward Euler, 
+// u_pred is just the state variable at the current iteration (i.e. u_n), and k 
+// is its time derivative u'.
+// NewtonSolver calls Mult to get R and GetGradient to get
 //
-//     J(k) = M_diag + γ·K_diag + γ·F'(u_pred + γ·k)
+//     J(u') = M_diag + γ·K_diag + γ·F'(u_pred + γ·u')
 // ---------------------------------------------------------------------------
 class RicciImplicitStageOp : public Operator
 {
@@ -199,8 +200,8 @@ public:
    // Cache the parameters for the current implicit stage
    void SetParameters(real_t gamma, const BlockVector &u_pred);
 
-   void Mult(const Vector &k, Vector &R) const override;
-   Operator &GetGradient(const Vector &k) const override;
+   void Mult(const Vector &k_vec, Vector &R_vec) const override;
+   Operator &GetGradient(const Vector &k_vec) const override;
 
 private:
    Ricci2DNonlinear   &_ricci;

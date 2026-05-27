@@ -18,9 +18,6 @@ void RogersRicciNLFIntegrator::AssembleElementVector(
       *elvec[s] = 0.0;
    }
 
-   // Single H1 space across blocks → same geometry/order on every block.
-   // 2*p + 3 is the order used by IncompressibleNeoHookeanIntegrator and is
-   // generous enough for the exponential coupling here.
    const IntegrationRule &ir =
       IntRules.Get(el[0]->GetGeomType(), 2 * el[0]->GetOrder() + 3);
 
@@ -30,17 +27,12 @@ void RogersRicciNLFIntegrator::AssembleElementVector(
       Tr.SetIntPoint(&ip);
       el[0]->CalcShape(ip, shape);
 
-      // omega does not appear in any F_x (PDF eq. 7), so we never read
-      // elfun[OMEGA_IDX] here — F_omega depends on T and phi only.
       const real_t T = shape * (*elfun[T_IDX]);
       const real_t n = shape * (*elfun[N_IDX]);
 
       const real_t phi = _phi->Eval(Tr, ip);
       const real_t Sn  = _Sn->Eval(Tr, ip);
 
-      // Regularisation: replace 1/T by 1/Treg with Treg = sqrt(T^2 + eps2).
-      // The Jacobian below uses the chain-rule derivative consistent with
-      // this regularisation, so Newton convergence is unaffected.
       const real_t Treg = std::sqrt(T*T + _eps2);
       const real_t A    = _Lambda - phi / Treg;
       const real_t eA   = std::exp(A);
@@ -51,9 +43,6 @@ void RogersRicciNLFIntegrator::AssembleElementVector(
 
       const real_t w = ip.weight * Tr.Weight();
 
-      // Always evolve T; omega and n only if their rows are active.
-      // Frozen rows stay at zero residual contribution → Newton sees only
-      // M*k_s, which drives k_s to 0 and leaves the predictor state intact.
       elvec[T_IDX]->Add(w * F_T, shape);
       if (_num_active >= 2) { elvec[OMEGA_IDX]->Add(w * F_w, shape); }
       if (_num_active >= 3) { elvec[N_IDX]    ->Add(w * F_n, shape); }
@@ -98,9 +87,7 @@ void RogersRicciNLFIntegrator::AssembleElementGrad(
       const real_t A    = _Lambda - phi / Treg;
       const real_t eA   = std::exp(A);
 
-      // d(1/Treg)/dT = -T/Treg^3   ⇒   dA/dT = phi*T/Treg^3.
-      // For T >> sqrt(eps2) this collapses to PDF eq. 8's phi/T^2 form;
-      // near T == 0 it stays bounded, unlike the bare PDF formula.
+      // d(1/Treg)/dT = -T/Treg^3   ->   dA/dT = phi*T/Treg^3.
       const real_t Treg3  = Treg * Treg * Treg;
       const real_t deA_dT = eA * phi * T / Treg3;
 
@@ -113,7 +100,6 @@ void RogersRicciNLFIntegrator::AssembleElementGrad(
 
       const real_t w = ip.weight * Tr.Weight();
 
-      // Same gating as the residual: only contribute to active-row blocks.
       AddMult_a_VVt(w * dFT_dT, shape, *elmats(T_IDX, T_IDX));
       if (_num_active >= 2)
       {
@@ -412,11 +398,6 @@ void Ricci2DNonlinear::SaveCheckpoint(const std::string &dir, real_t t,
 {
    const int myid = Mpi::WorldRank();
 
-   // Rank 0 creates the leaf directory (its parent <save_dir>/ was already
-   // created recursively by ParaViewDataCollection::Save just before us) and
-   // writes meta.txt.  create_directory returns false if the directory
-   // already exists (which is fine in single-slot mode); it only sets ec on
-   // hard filesystem errors.
    if (myid == 0)
    {
       std::error_code ec;
@@ -462,7 +443,6 @@ void Ricci2DNonlinear::SaveCheckpoint(const std::string &dir, real_t t,
    }
    save_gf("phi", *_phi);
 
-   // Make sure rank 0's meta.txt is visible to any spawned reader.
    MPI_Barrier(_comm);
 }
 
@@ -485,8 +465,8 @@ void Ricci2DNonlinear::LoadCheckpointMeta(const std::string &dir,
       ifs >> key >> step;
       MFEM_VERIFY(key == "step", "LoadCheckpointMeta: expected 'step' key.");
    }
-   MPI_Bcast(&t,    1, MPITypeMap<real_t>::mpi_type, 0, comm);
-   MPI_Bcast(&step, 1, MPI_INT,                      0, comm);
+   MPI_Bcast(&t, 1, MPITypeMap<real_t>::mpi_type, 0, comm);
+   MPI_Bcast(&step, 1, MPI_INT, 0, comm);
 }
 
 void Ricci2DNonlinear::syncGridFuncsFromBlocks(const BlockVector &u_blk)
@@ -508,15 +488,8 @@ void Ricci2DNonlinear::pullOmegaFromBlocks(const BlockVector &u_blk)
 
 void Ricci2DNonlinear::updatePhi()
 {
-   // RHS is the only thing that changes between stages: the omega coefficient
-   // is a live view into _vars[OMEGA_IDX] (refreshed by pullOmegaFromBlocks
-   // just before this call), so re-Assembling _b_phi picks up the predictor.
    _b_phi->Assemble();
 
-   // FormLinearSystem after the first call returns the same eliminated p_mat
-   // (no re-assembly), applies BC adjustment to B, and packs X with current
-   // _phi true-dof values.  The cached AMG and CG operators were bound to
-   // this same matrix in buildPhiSolver().
    OperatorPtr A;
    Vector X, B;
    _a_phi->FormLinearSystem(_ess_tdof_list_phi, *_phi, *_b_phi, A, X, B);
@@ -554,9 +527,6 @@ RicciImplicitStageOp::RicciImplicitStageOp(Ricci2DNonlinear &ricci)
      _tmp_block(ricci.H1FES()->GetTrueVSize()),
      _Jac_block(ricci.BlockTrueOffsets())
 {
-   // Workspace vectors participate in HypreParMatrix SpMV operations that go
-   // to device when Hypre is built with GPU support; mark them so the memory
-   // class follows the active Device().
    _z.UseDevice(true);
    _tmp_block.UseDevice(true);
 }
@@ -576,6 +546,7 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    MFEM_VERIFY(_u_pred != nullptr,
                "RicciImplicitStageOp: SetParameters() not called before Mult().");
 
+   // z = u_pred + gamma * k
    add(*_u_pred, _gamma, k_vec, _z);
 
    _z.HostRead();
@@ -583,10 +554,7 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    _ricci.FForm()->Mult(_z, R_vec);
    R_vec.ReadWrite(); // host-device sync
 
-
-   // R += M·k + K·z, applied block-by-block.  M and K are single-block H1
-   // operators replicated on the diagonal of the (otherwise zero-coupled in
-   // the linear part) 3-variable system.
+   // R += M·k + K·z
    const Array<int> &offs = _ricci.BlockTrueOffsets();
    BlockVector k_blk(const_cast<Vector&>(k_vec), offs);
    BlockVector R_blk(R_vec, offs);
@@ -611,16 +579,13 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
    // z = u_pred + gamma * k.
    add(*_u_pred, _gamma, k_vec, _z);
 
-   // F's 3x3 block gradient at z.  The integrator gates this on num_active
-   // — frozen rows produce no contribution.  Non-zero blocks (fully active)
-   // are (T,T), (omega,T), (n,T), (n,n).
    BlockOperator &Fgrad = _ricci.FForm()->GetGradient(_z);
    auto Fblock = [&](int i, int j) -> HypreParMatrix &
    {
       return dynamic_cast<HypreParMatrix &>(Fgrad.GetBlock(i, j));
    };
 
-   const int       n_active = _ricci.NumActive();
+   const int n_active = _ricci.NumActive();
    HypreParMatrix *M = _ricci.MassMat();
 
    // T row is always active.  M + gamma*K is precomputed in SetParameters.
@@ -628,7 +593,6 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
    _Jac_block.SetDiagonalBlock(T_IDX, _diag_T.get());
 
    // omega row: M + gamma*K if active (F'_omega,omega = 0), bare M if frozen
-   // so Newton drives k_omega to 0.
    _Jac_block.SetDiagonalBlock(OMEGA_IDX,
                                (n_active >= 2) ? _M_plus_gK.get() : M);
 
@@ -645,7 +609,6 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
    }
 
    // Off-diagonals: gamma * F'_{omega,T} and gamma * F'_{n,T}.
-   // Add(0, X, gamma, X) yields a fresh gamma*X HypreParMatrix.
    if (n_active >= 2)
    {
       _gFwT.reset(Add(0.0, Fblock(OMEGA_IDX, T_IDX),
