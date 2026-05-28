@@ -1,9 +1,5 @@
 #include "ex43p.hpp"
 
-// ===========================================================================
-//                   RogersRicciReactionOp implementation
-// ===========================================================================
-
 RogersRicciReactionOp::RogersRicciReactionOp(
    ParFiniteElementSpace &fes,
    const QuadratureSpace &qspace,
@@ -44,18 +40,14 @@ RogersRicciReactionOp::RogersRicciReactionOp(
      _dFn_dn_qfc(_dFn_dn_qf),
      _F_block(block_offsets)
 {
-   // Use byNODES (default) — vdim=1 throughout so layout is trivial.
 
-   // Scratch L- and E-vectors, device-aware.
+   // Scratch L- and E-vectors
    _l_vec_T.SetSize(fes.GetVSize());     _l_vec_T.UseDevice(true);
    _l_vec_n.SetSize(fes.GetVSize());     _l_vec_n.UseDevice(true);
    _e_vec_T.SetSize(_er->Height());      _e_vec_T.UseDevice(true);
    _e_vec_n.SetSize(_er->Height());      _e_vec_n.UseDevice(true);
 
-   // Residual assembly: one ParLinearForm per variable, each driven by a
-   // QuadratureFunctionCoefficient backed by our F_*_qf buffers.  The
-   // DomainLFIntegrator(QFC) takes the DLFEvalAssemble device path when
-   // Device("cuda") is active.
+   // One LF per variable
    auto make_lf = [&](QuadratureFunctionCoefficient &qfc)
    {
       auto lf = std::make_unique<ParLinearForm>(&fes);
@@ -68,9 +60,7 @@ RogersRicciReactionOp::RogersRicciReactionOp(
    _lf_omega = make_lf(_F_omega_qfc);
    _lf_n     = make_lf(_F_n_qfc);
 
-   // Jacobian assembly: one ParBilinearForm per non-zero F' block, PA mode.
-   // MassIntegrator(QFC) with COMPRESSED CoefficientVector storage reads QF
-   // data by reference (no copy) and runs AssemblePA on device.
+   // One ParBilinearForm per non-zero F' block
    auto make_bf = [&](QuadratureFunctionCoefficient &qfc)
    {
       auto bf = std::make_unique<ParBilinearForm>(&fes);
@@ -88,56 +78,34 @@ RogersRicciReactionOp::RogersRicciReactionOp(
 
 void RogersRicciReactionOp::Mult(const Vector &z_true, Vector &R_true) const
 {
-   // (a) Sample z at QPs (device): true -> L -> E -> Q for T and n.
+   // Sample z at QPs: T -> L -> E -> Q
    sampleStateToQPs(z_true);
-
-   // (b) Per-QP kernel (device): compute F_T, F_omega, F_n into QF buffers.
    computeReactionResidualAtQPs();
 
-   // (c) Assemble residual blocks via DomainLFIntegrator(QFC).  When Device
-   //     is "cuda", ParLinearForm::Assemble takes the DLFEvalAssemble path
-   //     which runs on device and reads coefficient data from QF directly.
    _lf_T->Assemble();
    if (_num_active >= 2) { _lf_omega->Assemble(); }
    if (_num_active >= 3) { _lf_n->Assemble(); }
 
-   // (d) ParallelAssemble each LF into the appropriate true-dof block of R.
-   //     Frozen rows get a clean zero so Newton's M·k_s = 0 equation drives
-   //     k_s to zero (matching the ex42p behaviour).
    BlockVector R_blk(R_true, _block_offsets);
    _lf_T->ParallelAssemble(R_blk.GetBlock(T_IDX));
+
    if (_num_active >= 2)
-   {
       _lf_omega->ParallelAssemble(R_blk.GetBlock(OMEGA_IDX));
-   }
    else
-   {
       R_blk.GetBlock(OMEGA_IDX) = 0.0;
-   }
+
    if (_num_active >= 3)
-   {
       _lf_n->ParallelAssemble(R_blk.GetBlock(N_IDX));
-   }
    else
-   {
       R_blk.GetBlock(N_IDX) = 0.0;
-   }
 }
 
 BlockOperator &RogersRicciReactionOp::GetGradient(const Vector &z_true) const
 {
-   // (a) Sample z at QPs (device): true -> L -> E -> Q for T and n.
+   
    sampleStateToQPs(z_true);
-
-   // (b) Per-QP kernel (device): write the four dF/du QFs.
    computeReactionJacobianAtQPs();
 
-   // (c) Re-assemble each PA bilinear form.  MassIntegrator's pa_data
-   //     caches the per-QP weighted coefficient values, so when the
-   //     underlying QF changes we must drop the cache and recompute via
-   //     AssemblePA.  FormSystemMatrix wraps the L-vector-acting PA
-   //     operator with P^T … P so it acts on true-dofs (returns an
-   //     OperatorHandle around a non-owning ConstrainedOperator).
    Array<int> empty_ess;
    auto rebuild = [&](ParBilinearForm &bf, OperatorHandle &out)
    {
@@ -162,29 +130,21 @@ BlockOperator &RogersRicciReactionOp::GetGradient(const Vector &z_true) const
       _F_block.SetBlock(N_IDX, N_IDX, _J_nn.Ptr());
    }
 
-   // The returned BlockOperator carries *unscaled* F'_* operators in its
-   // slots — the stage operator applies γ when composing with M + γK.
    return _F_block;
 }
 
 void RogersRicciReactionOp::sampleStateToQPs(const Vector &z_true) const
 {
-   // View the flat true-dof vector block-wise so we can sample variable by
-   // variable.  This is a non-owning const_cast (same idiom as MFEM's
-   // BlockOperator::Mult) — we only read.
    BlockVector z_blk(const_cast<Vector&>(z_true), _block_offsets);
 
    const Operator *P = _fes.GetProlongationMatrix();
 
-   // T pipeline: true -> L (Prolongation) -> E (ElementRestriction) ->
-   //             Q (QuadratureInterpolator::Values), all device-native.
+   // T branch
    P->Mult(z_blk.GetBlock(T_IDX), _l_vec_T);
    _er->Mult(_l_vec_T, _e_vec_T);
    _qi->Values(_e_vec_T, _T_qf);
 
-   // n pipeline (always — when num_active < 3 the value comes out frozen at
-   // its IC anyway, since Newton drives k_n to zero; resampling is one extra
-   // O(nDOFs) call per residual eval — cheap, keeps the kernel branchless).
+   // n branch
    P->Mult(z_blk.GetBlock(N_IDX), _l_vec_n);
    _er->Mult(_l_vec_n, _e_vec_n);
    _qi->Values(_e_vec_n, _n_qf);
@@ -248,8 +208,9 @@ void RogersRicciReactionOp::computeReactionJacobianAtQPs() const
       const real_t Treg  = sqrt(T*T + eps2);
       const real_t A     = Lambda - phi / Treg;
       const real_t eA    = exp(A);
-      const real_t Treg3 = Treg * Treg * Treg;
+
       // dA/dT = phi*T/Treg^3 (chain rule on Treg).
+      const real_t Treg3 = Treg * Treg * Treg;
       const real_t deA_dT = eA * phi * T / Treg3;
 
       dFT_dT_ptr[q] = (1.71 * eA - 0.71) / 36.0
@@ -414,8 +375,6 @@ void Ricci2DNonlinear::buildQuadratureSamples()
 
 void Ricci2DNonlinear::projectPhiToQuadrature()
 {
-   // Device-friendly: L (phi GridFunction is already an L-vector) -> E -> Q.
-   // Replaces the host-only QuadratureFunction::ProjectGridFunction path.
    _er_h1->Mult(*_phi, _phi_e_vec);
    _qi_h1->Values(_phi_e_vec, *_phi_qf);
 }
@@ -472,8 +431,6 @@ void Ricci2DNonlinear::buildPhiSolver()
 
 void Ricci2DNonlinear::buildNonlinearForm()
 {
-   // Device-native nonlinear reaction operator.  Replaces the host-only
-   // RogersRicciNLFIntegrator + ParBlockNonlinearForm used by ex42p.
    _reaction_op = std::make_unique<RogersRicciReactionOp>(
       *_h1_fes, *_qspace, _qspace->GetIntRule(0),
       _block_trueOffsets, *_phi_qf, *_Sn_qf,
@@ -501,7 +458,6 @@ void Ricci2DNonlinear::setOutput()
 
 namespace
 {
-// Variable name in the per-rank checkpoint file for each block index.
 const char *checkpoint_var_name(int idx)
 {
    switch (idx)
@@ -551,11 +507,6 @@ void Ricci2DNonlinear::SaveCheckpoint(const std::string &dir, real_t t,
 {
    const int myid = Mpi::WorldRank();
 
-   // Rank 0 creates the leaf directory (its parent <save_dir>/ was already
-   // created recursively by ParaViewDataCollection::Save just before us) and
-   // writes meta.txt.  create_directory returns false if the directory
-   // already exists (which is fine in single-slot mode); it only sets ec on
-   // hard filesystem errors.
    if (myid == 0)
    {
       std::error_code ec;
@@ -647,15 +598,8 @@ void Ricci2DNonlinear::pullOmegaFromBlocks(const BlockVector &u_blk)
 
 void Ricci2DNonlinear::updatePhi()
 {
-   // RHS is the only thing that changes between stages: the omega coefficient
-   // is a live view into _vars[OMEGA_IDX] (refreshed by pullOmegaFromBlocks
-   // just before this call), so re-Assembling _b_phi picks up the predictor.
    _b_phi->Assemble();
 
-   // FormLinearSystem after the first call returns the same eliminated p_mat
-   // (no re-assembly), applies BC adjustment to B, and packs X with current
-   // _phi true-dof values.  The cached AMG and CG operators were bound to
-   // this same matrix in buildPhiSolver().
    OperatorPtr A;
    Vector X, B;
    _a_phi->FormLinearSystem(_ess_tdof_list_phi, *_phi, *_b_phi, A, X, B);
@@ -693,9 +637,6 @@ RicciImplicitStageOp::RicciImplicitStageOp(Ricci2DNonlinear &ricci)
      _tmp_block(ricci.H1FES()->GetTrueVSize()),
      _Jac_block(ricci.BlockTrueOffsets())
 {
-   // Workspace vectors participate in HypreParMatrix SpMV operations that go
-   // to device when Hypre is built with GPU support; mark them so the memory
-   // class follows the active Device().
    _z.UseDevice(true);
    _tmp_block.UseDevice(true);
 }
@@ -715,14 +656,13 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    MFEM_VERIFY(_u_pred != nullptr,
                "RicciImplicitStageOp: SetParameters() not called before Mult().");
 
+   // z = u_pred + gamma * k
    add(*_u_pred, _gamma, k_vec, _z);
 
-   // Device-native reaction op.
+   // R = F(z)
    _ricci.ReactionOp()->Mult(_z, R_vec);
 
-   // R += M·k + K·z, applied block-by-block.  M and K are single-block H1
-   // operators replicated on the diagonal of the (otherwise zero-coupled in
-   // the linear part) 3-variable system.
+   // R += M·k + K·z
    const Array<int> &offs = _ricci.BlockTrueOffsets();
    BlockVector k_blk(const_cast<Vector&>(k_vec), offs);
    BlockVector R_blk(R_vec, offs);
@@ -747,19 +687,12 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
    // z = u_pred + gamma * k.
    add(*_u_pred, _gamma, k_vec, _z);
 
-   // PA F'_* blocks (unscaled), all on device — no HypreParMatrix
-   // construction.
+   // PA F'_* blocks (unscaled)
    BlockOperator &Fgrad = _ricci.ReactionOp()->GetGradient(_z);
 
    const int       n_active = _ricci.NumActive();
    HypreParMatrix *M        = _ricci.MassMat();
    HypreParMatrix *MgK      = _M_plus_gK.get();   // built in SetParameters
-
-   // Compose the Jacobian block-by-block.  Diagonals: (M+γK) ⊕ γ·F'_*.
-   // Off-diagonals: γ·F'_*.  The SumOperator / ScaledOperator wrappers
-   // hold pointers (no SpMV at construction time) — actual matrix-vector
-   // applies happen inside GMRES.  Operands stay alive across Newton
-   // iters because the underlying PA forms persist in RogersRicciReactionOp.
 
    // T row is always active.
    _diag_T = std::make_unique<SumOperator>(MgK, 1.0,
@@ -867,24 +800,15 @@ public:
       }
    }
 
-   // Called once per implicit stage (before Newton begins).  Configures the
-   // AMG hierarchies on the static (M + γK) operand — these are valid for
-   // the whole stage because M + γK doesn't depend on the Newton iterate.
-   // Saves a redundant AMG setup per Newton iter.
    void SetPrecondOperands(HypreParMatrix &M,
                            HypreParMatrix &M_plus_gK,
                            int num_active)
    {
-      // T row is always active.
       _amgs[T_IDX]->SetOperator(M_plus_gK);
       _amgs[OMEGA_IDX]->SetOperator((num_active >= 2) ? M_plus_gK : M);
       _amgs[N_IDX]->SetOperator((num_active >= 3) ? M_plus_gK : M);
    }
 
-   // Per-Newton-iter: only updates GMRES's system operator.  Does NOT
-   // re-setup AMG (its operand M+γK is constant for the whole stage and
-   // was pinned by SetPrecondOperands).  Builds the BDP on first call,
-   // now that we know the offsets.
    void SetOperator(const Operator &op) override
    {
       const BlockOperator *bop = dynamic_cast<const BlockOperator*>(&op);
@@ -966,9 +890,6 @@ void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
    // Set up M + γK
    _stage_op.SetParameters(gamma, u_pred_blk);
 
-   // Pin the linear solver's AMG hierarchies to the static M+γK operand —
-   // once per stage, not once per Newton iter.  Saves redundant AMG setup
-   // calls (M+γK doesn't depend on the Newton iterate).
    auto *block_solver =
       dynamic_cast<BlockNewtonLinearSolver*>(_lin_solver.get());
    MFEM_VERIFY(block_solver,
@@ -1134,7 +1055,6 @@ int main(int argc, char *argv[])
       ode_solver->Step(*ricci.StateBlocks(), t, dt_step);
       ++step;
 
-      // Mirror the new state into the per-variable ParGridFunctions for I/O.
       ricci.syncGridFuncsFromBlocks(*ricci.StateBlocks());
 
       if (myid == 0)

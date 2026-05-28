@@ -10,22 +10,6 @@ enum VarIdx : int { T_IDX = 0, OMEGA_IDX = 1, N_IDX = 2 };
 constexpr int NUM_VARS = 3;
 
 // Device-native nonlinear reaction operator for the Rogers-Ricci system.
-// Replaces the host-only RogersRicciNLFIntegrator + ParBlockNonlinearForm
-// pipeline used by the original ex42p.  Pipeline:
-//   1. sampleStateToQPs:   true-dof z = (T, ω, n) -> per-block QFs for T, n
-//      (Prolongation -> ElementRestriction -> QuadratureInterpolator::Values,
-//       all device-native, all mfem::forall).
-//   2. computeReactionResidualAtQPs / computeReactionJacobianAtQPs: custom
-//      mfem::forall kernels that read T_qf, n_qf, phi_qf, Sn_qf and write
-//      F_*_qf (residual) and dF_*/du_*_qf (Jacobian entries).
-//   3. Mult:        three ParLinearForms with DomainLFIntegrator(QFC) take the
-//                   freshly-populated F_*_qf and assemble the residual blocks
-//                   on device (DLFEvalAssemble path).
-//   4. GetGradient: four ParBilinearForms with MassIntegrator(QFC) and
-//                   AssemblyLevel::PARTIAL produce device-native PA operators
-//                   wrapped by FormSystemOperator so they act on true-dofs.
-//                   The returned BlockOperator holds unscaled F'_* in its
-//                   slots — the stage op applies γ when composing with M+γK.
 class RogersRicciReactionOp : public Operator
 {
 public:
@@ -40,8 +24,6 @@ public:
                          real_t eps2);
 
    void Mult(const Vector &z_true, Vector &R_true) const override;
-   // Covariant return — base class returns Operator&; the caller can
-   // address blocks directly without an explicit dynamic_cast.
    BlockOperator &GetGradient(const Vector &z_true) const override;
 
 private:
@@ -62,10 +44,9 @@ private:
    const ElementRestrictionOperator *_er;
    const QuadratureInterpolator     *_qi;
 
-   // QPs samples of the state.  T always populated; n only when num_active>=3.
    mutable QuadratureFunction _T_qf, _n_qf;
 
-   // Per-QP residual contributions (vdim=1 each, on _qspace).
+   // Per-QP residual contributions.
    mutable QuadratureFunction _F_T_qf, _F_omega_qf, _F_n_qf;
    mutable QuadratureFunctionCoefficient _F_T_qfc, _F_omega_qfc, _F_n_qfc;
 
@@ -74,7 +55,7 @@ private:
    mutable QuadratureFunctionCoefficient _dFT_dT_qfc, _dFw_dT_qfc,
                                           _dFn_dT_qfc, _dFn_dn_qfc;
 
-   // Scratch L- and E-vectors (allocated once, reused).
+   // Scratch L- and E-vectors.
    mutable Vector _l_vec_T, _l_vec_n;
    mutable Vector _e_vec_T, _e_vec_n;
 
@@ -128,13 +109,13 @@ public:
    void syncBlocksFromGridFuncs(BlockVector &u_blk) const;
 
    const Array<int>      &BlockTrueOffsets() const { return _block_trueOffsets; }
-   ParFiniteElementSpace *H1FES()             const { return _h1_fes.get();     }
-   RogersRicciReactionOp *ReactionOp()        const { return _reaction_op.get(); }
-   HypreParMatrix        *MassMat()           const { return _M_mat.get();      }
-   HypreParMatrix        *KMat()              const { return _K_mat.get();      }
-   ParGridFunction       *Phi()               const { return _phi.get();        }
-   BlockVector           *StateBlocks()       const { return _var_blocks.get(); }
-   int                    NumActive()         const { return _num_active;       }
+   ParFiniteElementSpace *H1FES() const { return _h1_fes.get(); }
+   RogersRicciReactionOp *ReactionOp() const { return _reaction_op.get(); }
+   HypreParMatrix        *MassMat() const { return _M_mat.get(); }
+   HypreParMatrix        *KMat() const { return _K_mat.get(); }
+   ParGridFunction       *Phi() const { return _phi.get(); }
+   BlockVector           *StateBlocks() const { return _var_blocks.get(); }
+   int                    NumActive() const { return _num_active; }
 
    real_t _xL, _yL;
    int    _order, _ref_levels;
@@ -212,15 +193,13 @@ private:
    std::unique_ptr<QuadratureFunctionCoefficient>       _phi_qfc;
    std::unique_ptr<QuadratureFunctionCoefficient>       _Sn_qfc;
 
-   // Cached pointers + scratch E-vector for the device-friendly phi → QP
-   // pipeline used by projectPhiToQuadrature.  Both pointers are FES-owned;
-   // we don't free them.  The E-vector is sized to _er_h1->Height().
+   // Cached pointers + scratch E-vector for the device-friendly phi -> QP
+   // pipeline used by projectPhiToQuadrature.  Both pointers are FES-owned
    const ElementRestrictionOperator                    *_er_h1 = nullptr;
    const QuadratureInterpolator                        *_qi_h1 = nullptr;
    Vector                                               _phi_e_vec;
 
    std::unique_ptr<RogersRicciReactionOp>               _reaction_op;
-
    std::unique_ptr<ParaViewDataCollection>              _dc;
 };
 

@@ -348,7 +348,6 @@ void Ricci2DNonlinear::setOutput()
 
 namespace
 {
-// Variable name in the per-rank checkpoint file for each block index.
 const char *checkpoint_var_name(int idx)
 {
    switch (idx)
@@ -549,6 +548,7 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    // z = u_pred + gamma * k
    add(*_u_pred, _gamma, k_vec, _z);
 
+   // R = F(z)
    _z.HostRead();
    R_vec.HostWrite(); // overwrite on host
    _ricci.FForm()->Mult(_z, R_vec);
