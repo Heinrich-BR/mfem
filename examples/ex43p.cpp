@@ -83,6 +83,12 @@ RogersRicciReactionOp::RogersRicciReactionOp(
 
 void RogersRicciReactionOp::Mult(const Vector &z_true, Vector &R_true) const
 {
+   // The output here is the NewtonSolver's internal `r` (we don't construct
+   // it).  Pin its memory to the device so subsequent host-target writes (the
+   // `R_blk.GetBlock(s) = 0.0` lines below on frozen rows) don't thrash the
+   // Memory's validity flags against the device writes from ParallelAssemble.
+   R_true.UseDevice(true);
+
    // Sample z at QPs: T -> L -> E -> Q
    sampleStateToQPs(z_true);
    computeReactionResidualAtQPs();
@@ -92,6 +98,9 @@ void RogersRicciReactionOp::Mult(const Vector &z_true, Vector &R_true) const
    if (_num_active >= 3) { _lf_n->Assemble(); }
 
    BlockVector R_blk(R_true, _block_offsets);
+   R_blk.UseDevice(true);
+   for (int s = 0; s < NUM_VARS; ++s) { R_blk.GetBlock(s).UseDevice(true); }
+
    _lf_T->ParallelAssemble(R_blk.GetBlock(T_IDX));
 
    if (_num_active >= 2)
@@ -310,19 +319,26 @@ void Ricci2DNonlinear::buildState()
 {
    _vars.resize(NUM_VARS);
    for (int i = 0; i < NUM_VARS; ++i)
+   {
       _vars[i] = std::make_unique<ParGridFunction>(_h1_fes.get());
+      _vars[i]->UseDevice(true);
+   }
 
    _phi = std::make_unique<ParGridFunction>(_h1_fes.get());
+   _phi->UseDevice(true);
 
    _block_trueOffsets.SetSize(NUM_VARS + 1);
    _block_trueOffsets[0] = 0;
 
    for (int i = 0; i < NUM_VARS; ++i)
       _block_trueOffsets[i + 1] = _h1_fes->GetTrueVSize();
-   
+
    _block_trueOffsets.PartialSum();
 
    _var_blocks = std::make_unique<BlockVector>(_block_trueOffsets);
+   _var_blocks->UseDevice(true);
+   for (int i = 0; i < NUM_VARS; ++i)
+      _var_blocks->GetBlock(i).UseDevice(true);
 }
 
 void Ricci2DNonlinear::buildCoefficients()
@@ -741,6 +757,12 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    MFEM_VERIFY(_u_pred != nullptr,
                "RicciImplicitStageOp: SetParameters() not called before Mult().");
 
+   // Pin the Newton-owned iterate and residual to device memory.  These are
+   // sized inside NewtonSolver where we can't reach the flag; doing it here on
+   // every call is harmless once set.
+   const_cast<Vector&>(k_vec).UseDevice(true);
+   R_vec.UseDevice(true);
+
    // z = u_pred + gamma * k
    add(*_u_pred, _gamma, k_vec, _z);
 
@@ -751,6 +773,13 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    const Array<int> &offs = _ricci.BlockTrueOffsets();
    BlockVector k_blk(const_cast<Vector&>(k_vec), offs);
    BlockVector R_blk(R_vec, offs);
+   k_blk.UseDevice(true);
+   R_blk.UseDevice(true);
+   for (int s = 0; s < NUM_VARS; ++s)
+   {
+      k_blk.GetBlock(s).UseDevice(true);
+      R_blk.GetBlock(s).UseDevice(true);
+   }
 
    Operator *M = _ricci.MassOp();
    Operator *K = _ricci.KOp();
@@ -945,6 +974,10 @@ public:
 
    void Mult(const Vector &b, Vector &x) const override
    {
+      // Pin Newton's residual (input) and direction (output) to device memory.
+      const_cast<Vector&>(b).UseDevice(true);
+      x.UseDevice(true);
+
       // Propagate adaptive rtol set by NewtonSolver since the last call.
       _gmres.SetRelTol(rel_tol);
       _gmres.SetAbsTol(abs_tol);
@@ -1001,8 +1034,16 @@ void RicciTimeOperator::EnableEisenstatWalker(real_t rtol0, real_t rtol_max)
 void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
                                       Vector &k)
 {
+   // Pin the ODE-owned stage derivative `k` and the predictor `u_pred` to
+   // device memory.  These live in the ODE solver, where we can't set the flag
+   // at construction; doing it here on every stage is harmless once set.
+   k.UseDevice(true);
+   const_cast<Vector&>(u_pred).UseDevice(true);
+
    BlockVector u_pred_blk(const_cast<Vector&>(u_pred),
                           _ricci.BlockTrueOffsets());
+   u_pred_blk.UseDevice(true);
+   for (int s = 0; s < NUM_VARS; ++s) { u_pred_blk.GetBlock(s).UseDevice(true); }
 
    _ricci.pullOmegaFromBlocks(u_pred_blk);
    _ricci.updatePhi();
