@@ -1156,11 +1156,7 @@ int main(int argc, char *argv[])
                   "BoomerAMG.");
    args.AddOption(&gpu_aware_mpi, "-gpumpi", "--gpu-aware-mpi",
                   "-no-gpumpi", "--no-gpu-aware-mpi",
-                  "Tell MFEM the linked MPI is GPU-aware: parallel exchanges "
-                  "(e.g. P/P^T inside ParallelAssemble/ParallelProject) pass "
-                  "device pointers directly to MPI instead of staging through "
-                  "host memory.  Requires both the MPI runtime and (for any "
-                  "Hypre traffic) Hypre itself to be GPU-aware-MPI-capable.");
+                  "Tell MFEM the linked MPI is GPU-aware");
    args.AddOption(&phi_lor, "-lor", "--phi-lor", "-no-lor", "--no-phi-lor",
                   "Solve the phi Poisson problem with a PA operator "
                   "preconditioned by LOR-AMG (on) or an assembled Laplacian "
@@ -1257,10 +1253,22 @@ int main(int argc, char *argv[])
    ode_solver->Init(time_op);
 
    const real_t t_tol = 1e-12 * std::max(t_final, dt);
+
+   const int initial_step = step;
+   StopWatch step_timer;
+   step_timer.Clear();
+
    while (t < t_final - t_tol)
    {
+      MFEM_DEVICE_SYNC;
+      step_timer.Start();
+
       real_t dt_step = std::min(dt, t_final - t);
       ode_solver->Step(*ricci.StateBlocks(), t, dt_step);
+
+      MFEM_DEVICE_SYNC;
+      step_timer.Stop();
+
       ++step;
 
       ricci.syncGridFuncsFromBlocks(*ricci.StateBlocks());
@@ -1282,6 +1290,28 @@ int main(int argc, char *argv[])
          ricci.updateDataCollection(step, t);
          ricci.Save();
          ricci.SaveCheckpoint(cdir, t, step);
+      }
+   }
+
+   // Print timing summary
+   if (myid == 0)
+   {
+      const int steps_run = step - initial_step;
+      const double total = step_timer.RealTime();
+      const long long global_dofs =
+         static_cast<long long>(NUM_VARS) * ricci.H1FES()->GlobalTrueVSize();
+      std::cout << "\n=== Timing ===\n";
+      std::cout << "Total time-stepping time:        " << total << " s\n";
+      std::cout << "Steps in this run:               " << steps_run << "\n";
+      std::cout << "Global true DoFs (NUM_VARS x N): " << global_dofs << "\n";
+      if (steps_run > 0)
+      {
+         const double per_step = total / steps_run;
+         std::cout << "Average time per step:           "
+                   << per_step << " s\n";
+         std::cout << "Average time per step per DoF:   "
+                   << per_step / static_cast<double>(global_dofs)
+                   << " s/DoF" << std::endl;
       }
    }
 
