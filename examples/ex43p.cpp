@@ -55,9 +55,7 @@ RogersRicciReactionOp::RogersRicciReactionOp(
       auto *integ = new DomainLFIntegrator(qfc);
       integ->SetIntRule(&ir);
       lf->AddDomainIntegrator(integ);
-      // Device-resident assembly of the QuadratureFunctionCoefficient residual;
-      // without this the (device-computed) QF is copied back to host and
-      // integrated on the CPU every residual evaluation.
+      // Device-resident assembly of the QuadratureFunctionCoefficient residual
       lf->UseFastAssembly(true);
       return lf;
    };
@@ -83,10 +81,6 @@ RogersRicciReactionOp::RogersRicciReactionOp(
 
 void RogersRicciReactionOp::Mult(const Vector &z_true, Vector &R_true) const
 {
-   // The output here is the NewtonSolver's internal `r` (we don't construct
-   // it).  Pin its memory to the device so subsequent host-target writes (the
-   // `R_blk.GetBlock(s) = 0.0` lines below on frozen rows) don't thrash the
-   // Memory's validity flags against the device writes from ParallelAssemble.
    R_true.UseDevice(true);
 
    // Sample z at QPs: T -> L -> E -> Q
@@ -100,10 +94,7 @@ void RogersRicciReactionOp::Mult(const Vector &z_true, Vector &R_true) const
    BlockVector R_blk(R_true, _block_offsets);
    R_blk.UseDevice(true);
    for (int s = 0; s < NUM_VARS; ++s) { R_blk.GetBlock(s).UseDevice(true); }
-   // Propagate the parent's Memory-validity flags to the block aliases before
-   // writing through them; without this, on-device writes to a single block
-   // leave the parent's flags stale and a subsequent read of R_true triggers a
-   // spurious host->device sync that clobbers the alias writes.
+
    R_blk.SyncToBlocks();
 
    _lf_T->ParallelAssemble(R_blk.GetBlock(T_IDX));
@@ -118,8 +109,6 @@ void RogersRicciReactionOp::Mult(const Vector &z_true, Vector &R_true) const
    else
       R_blk.GetBlock(N_IDX) = 0.0;
 
-   // Push the (now-correct) block validity flags back into the parent so the
-   // caller sees a consistent R_true.
    R_blk.SyncFromBlocks();
 }
 
@@ -162,8 +151,6 @@ void RogersRicciReactionOp::sampleStateToQPs(const Vector &z_true) const
    BlockVector z_blk(const_cast<Vector&>(z_true), _block_offsets);
    z_blk.UseDevice(true);
    for (int s = 0; s < NUM_VARS; ++s) { z_blk.GetBlock(s).UseDevice(true); }
-   // Propagate the parent's Memory-validity flags to the aliases before reading
-   // them; otherwise a block read on device may pull stale host data.
    z_blk.SyncToBlocks();
 
    const Operator *P = _fes.GetProlongationMatrix();
@@ -487,10 +474,6 @@ void Ricci2DNonlinear::buildPhiSolver()
 
    _a_phi->FormSystemMatrix(_ess_tdof_list_phi, _A_phi);
 
-   // Preconditioner: BoomerAMG on the LOR low-order Laplacian (phi_lor) or on
-   // the assembled high-order Laplacian.  The Laplacian is constant, so the LOR
-   // matrix and AMG setup are built once.  The LOR AMG is built via the
-   // HypreParMatrix constructor (not LORSolver / SetOperator).
    if (_phi_lor)
    {
       _lor_disc = std::make_unique<ParLORDiscretization>(
@@ -510,10 +493,6 @@ void Ricci2DNonlinear::buildPhiSolver()
    _cg_phi->SetRelTol(1e-12);
    _cg_phi->SetMaxIter(2000);
    _cg_phi->SetPrintLevel(0);
-   // Set the operator before the preconditioner: IterativeSolver::SetOperator
-   // forwards its operator to the preconditioner, which would hand the
-   // matrix-free PA Laplacian to BoomerAMG (it requires a HypreParMatrix).  The
-   // AMG operand is already bound (LOR matrix or assembled Laplacian) above.
    _cg_phi->SetOperator(*_A_phi);
    _cg_phi->SetPreconditioner(*phi_prec);
 }
@@ -672,8 +651,6 @@ void Ricci2DNonlinear::LoadCheckpointMeta(const std::string &dir,
 
 void Ricci2DNonlinear::syncGridFuncsFromBlocks(const BlockVector &u_blk)
 {
-   // Block aliases need the parent's current validity flags before they are
-   // read on device.
    u_blk.SyncToBlocks();
    for (int i = 0; i < NUM_VARS; ++i)
       _vars[i]->SetFromTrueDofs(u_blk.GetBlock(i));
@@ -683,8 +660,6 @@ void Ricci2DNonlinear::syncBlocksFromGridFuncs(BlockVector &u_blk) const
 {
    for (int i = 0; i < NUM_VARS; ++i)
       _vars[i]->ParallelProject(u_blk.GetBlock(i));
-   // The writes above updated only the block aliases; propagate their validity
-   // back to the parent so subsequent flat-vector reads of u_blk see them.
    u_blk.SyncFromBlocks();
 }
 
@@ -716,7 +691,6 @@ void Ricci2DNonlinear::reassembleK()
    {
       Array<int> empty_ess;
       _K_form->FormSystemMatrix(empty_ess, _K_op);
-      // Jacobi diagonal from the SUW-diffusion companion (convection omitted).
       _K_diff_form->Update();
       _K_diff_form->Assemble();
       _K_diag.SetSize(_h1_fes->GetTrueVSize());
@@ -761,7 +735,7 @@ void RicciImplicitStageOp::SetParameters(real_t gamma, const BlockVector &u_pred
 
    if (_ricci.MatrixFree())
    {
-      // Matrix-free M + γK: a SumOperator over the PA M and K operators.
+      // Matrix-free M + γK
       _M_plus_gK_mf = std::make_unique<SumOperator>(
          _ricci.MassOp(), 1.0, _ricci.KOp(), _gamma,
          /*ownA=*/false, /*ownB=*/false);
@@ -779,16 +753,12 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    MFEM_VERIFY(_u_pred != nullptr,
                "RicciImplicitStageOp: SetParameters() not called before Mult().");
 
-   // Pin the Newton-owned iterate and residual to device memory.  These are
-   // sized inside NewtonSolver where we can't reach the flag; doing it here on
-   // every call is harmless once set.
    const_cast<Vector&>(k_vec).UseDevice(true);
    R_vec.UseDevice(true);
 
    // z = u_pred + gamma * k
    add(*_u_pred, _gamma, k_vec, _z);
-   // `add` wrote to _z's parent storage but its block aliases (used below via
-   // `_z.GetBlock(s)` for K->Mult) still carry stale validity flags.
+
    _z.SyncToBlocks();
 
    // R = F(z)
@@ -805,9 +775,6 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
       k_blk.GetBlock(s).UseDevice(true);
       R_blk.GetBlock(s).UseDevice(true);
    }
-   // Pull parent validity flags into the block aliases.  R_true was just
-   // written by ReactionOp->Mult above (which already called SyncFromBlocks),
-   // so R_true's flags are authoritative; same for k_vec from the Newton iter.
    k_blk.SyncToBlocks();
    R_blk.SyncToBlocks();
 
@@ -821,8 +788,6 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
       R_blk.GetBlock(s) += _tmp_block;
    }
 
-   // Push the updated block flags back into R_vec so the caller (NewtonSolver)
-   // sees consistent device state.
    R_blk.SyncFromBlocks();
 }
 
@@ -948,7 +913,7 @@ public:
       SetMaxIter(max_it);
       _gmres.SetKDim(kdim);
       _gmres.SetPrintLevel(0);
-      _jacobi.resize(NUM_VARS);   // matrix-free: built lazily per stage
+      _jacobi.resize(NUM_VARS);
       if (!_matrix_free)
       {
          _amgs.resize(NUM_VARS);
@@ -970,9 +935,6 @@ public:
       _amgs[N_IDX]->SetOperator((num_active >= 3) ? M_plus_gK : M);
    }
 
-   // Matrix-free path: (re)load the per-block Jacobi diagonals.  The γ·F'
-   // diagonal contribution is intentionally omitted, matching the legacy AMG
-   // preconditioner which is built on M+γK only.
    void SetPrecondDiagonals(const Vector &d_T, const Vector &d_w,
                             const Vector &d_n)
    {
@@ -1009,7 +971,6 @@ public:
 
    void Mult(const Vector &b, Vector &x) const override
    {
-      // Pin Newton's residual (input) and direction (output) to device memory.
       const_cast<Vector&>(b).UseDevice(true);
       x.UseDevice(true);
 
@@ -1069,9 +1030,6 @@ void RicciTimeOperator::EnableEisenstatWalker(real_t rtol0, real_t rtol_max)
 void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
                                       Vector &k)
 {
-   // Pin the ODE-owned stage derivative `k` and the predictor `u_pred` to
-   // device memory.  These live in the ODE solver, where we can't set the flag
-   // at construction; doing it here on every stage is harmless once set.
    k.UseDevice(true);
    const_cast<Vector&>(u_pred).UseDevice(true);
 

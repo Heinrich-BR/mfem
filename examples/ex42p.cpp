@@ -194,19 +194,26 @@ void Ricci2DNonlinear::buildState()
 {
    _vars.resize(NUM_VARS);
    for (int i = 0; i < NUM_VARS; ++i)
+   {
       _vars[i] = std::make_unique<ParGridFunction>(_h1_fes.get());
+      _vars[i]->UseDevice(true);
+   }
 
    _phi = std::make_unique<ParGridFunction>(_h1_fes.get());
+   _phi->UseDevice(true);
 
    _block_trueOffsets.SetSize(NUM_VARS + 1);
    _block_trueOffsets[0] = 0;
 
    for (int i = 0; i < NUM_VARS; ++i)
       _block_trueOffsets[i + 1] = _h1_fes->GetTrueVSize();
-   
+
    _block_trueOffsets.PartialSum();
 
    _var_blocks = std::make_unique<BlockVector>(_block_trueOffsets);
+   _var_blocks->UseDevice(true);
+   for (int i = 0; i < NUM_VARS; ++i)
+      _var_blocks->GetBlock(i).UseDevice(true);
 }
 
 void Ricci2DNonlinear::buildCoefficients()
@@ -470,6 +477,7 @@ void Ricci2DNonlinear::LoadCheckpointMeta(const std::string &dir,
 
 void Ricci2DNonlinear::syncGridFuncsFromBlocks(const BlockVector &u_blk)
 {
+   u_blk.SyncToBlocks();
    for (int i = 0; i < NUM_VARS; ++i)
       _vars[i]->SetFromTrueDofs(u_blk.GetBlock(i));
 }
@@ -478,10 +486,12 @@ void Ricci2DNonlinear::syncBlocksFromGridFuncs(BlockVector &u_blk) const
 {
    for (int i = 0; i < NUM_VARS; ++i)
       _vars[i]->ParallelProject(u_blk.GetBlock(i));
+   u_blk.SyncFromBlocks();
 }
 
 void Ricci2DNonlinear::pullOmegaFromBlocks(const BlockVector &u_blk)
 {
+   u_blk.SyncToBlocks();
    _vars[OMEGA_IDX]->SetFromTrueDofs(u_blk.GetBlock(OMEGA_IDX));
 }
 
@@ -545,10 +555,14 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    MFEM_VERIFY(_u_pred != nullptr,
                "RicciImplicitStageOp: SetParameters() not called before Mult().");
 
+   const_cast<Vector&>(k_vec).UseDevice(true);
+   R_vec.UseDevice(true);
+
    // z = u_pred + gamma * k
    add(*_u_pred, _gamma, k_vec, _z);
+   _z.SyncToBlocks();
 
-   // R = F(z)
+   // R = F(z) on host (ParBlockNonlinearForm with host-only NLFIntegrator).
    _z.HostRead();
    R_vec.HostWrite(); // overwrite on host
    _ricci.FForm()->Mult(_z, R_vec);
@@ -558,6 +572,15 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    const Array<int> &offs = _ricci.BlockTrueOffsets();
    BlockVector k_blk(const_cast<Vector&>(k_vec), offs);
    BlockVector R_blk(R_vec, offs);
+   k_blk.UseDevice(true);
+   R_blk.UseDevice(true);
+   for (int s = 0; s < NUM_VARS; ++s)
+   {
+      k_blk.GetBlock(s).UseDevice(true);
+      R_blk.GetBlock(s).UseDevice(true);
+   }
+   k_blk.SyncToBlocks();
+   R_blk.SyncToBlocks();
 
    HypreParMatrix *M = _ricci.MassMat();
    HypreParMatrix *K = _ricci.KMat();
@@ -568,6 +591,8 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
       K->Mult(_z.GetBlock(s), _tmp_block);
       R_blk.GetBlock(s) += _tmp_block;
    }
+
+   R_blk.SyncFromBlocks();
 }
 
 Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
@@ -578,6 +603,8 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
 
    // z = u_pred + gamma * k.
    add(*_u_pred, _gamma, k_vec, _z);
+   _z.SyncToBlocks();
+   _z.HostRead();
 
    BlockOperator &Fgrad = _ricci.FForm()->GetGradient(_z);
    auto Fblock = [&](int i, int j) -> HypreParMatrix &
@@ -647,21 +674,25 @@ public:
 
       const real_t sigma = 1e-4;
       const int max_tries = 20;
-      Vector x_trial(x.Size()), r_trial(r.Size());
+      _x_trial.SetSize(x.Size()); _x_trial.UseDevice(true);
+      _r_trial.SetSize(r.Size()); _r_trial.UseDevice(true);
       real_t alpha = 1.0;
 
       for (int i = 0; i < max_tries; ++i)
       {
-         add(x, -alpha, c, x_trial);
-         oper->Mult(x_trial, r_trial);
-         if (b.Size() == r_trial.Size()) { r_trial -= b; }
-         const real_t norm_trial = Norm(r_trial);
+         add(x, -alpha, c, _x_trial);
+         oper->Mult(_x_trial, _r_trial);
+         if (b.Size() == _r_trial.Size()) { _r_trial -= b; }
+         const real_t norm_trial = Norm(_r_trial);
          if (norm_trial <= (1.0 - sigma * alpha) * norm0) { return alpha; }
          alpha *= 0.5;
       }
       // Couldn't satisfy Armijo; return the smallest tried
       return alpha;
    }
+
+private:
+   mutable Vector _x_trial, _r_trial;
 };
 
 // Block Krylov solver consumed by NewtonSolver as its linear solver.
@@ -716,7 +747,11 @@ public:
 
    void Mult(const Vector &b, Vector &x) const override
    {
-      // Propagate adaptive rtol set by NewtonSolver since the last call. 
+      // Pin Newton's residual (input) and direction (output) to device memory.
+      const_cast<Vector&>(b).UseDevice(true);
+      x.UseDevice(true);
+
+      // Propagate adaptive rtol set by NewtonSolver since the last call.
       _gmres.SetRelTol(rel_tol);
       _gmres.SetAbsTol(abs_tol);
       _gmres.SetMaxIter(max_iter);
@@ -762,8 +797,14 @@ void RicciTimeOperator::EnableEisenstatWalker(real_t rtol0, real_t rtol_max)
 void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
                                       Vector &k)
 {
+   k.UseDevice(true);
+   const_cast<Vector&>(u_pred).UseDevice(true);
+
    BlockVector u_pred_blk(const_cast<Vector&>(u_pred),
                           _ricci.BlockTrueOffsets());
+   u_pred_blk.UseDevice(true);
+   for (int s = 0; s < NUM_VARS; ++s) { u_pred_blk.GetBlock(s).UseDevice(true); }
+   u_pred_blk.SyncToBlocks();
 
    _ricci.pullOmegaFromBlocks(u_pred_blk);
    _ricci.updatePhi();
