@@ -27,10 +27,11 @@ public:
    void Mult(const Vector &z_true, Vector &R_true) const override;
    BlockOperator &GetGradient(const Vector &z_true) const override;
 
-private:
-   void sampleStateToQPs(const Vector &z_true) const;
    void computeReactionResidualAtQPs() const;
    void computeReactionJacobianAtQPs() const;
+
+private:
+   void sampleStateToQPs(const Vector &z_true) const;
 
    ParFiniteElementSpace            &_fes;
    const QuadratureSpace            &_qspace;
