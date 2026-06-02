@@ -8,6 +8,7 @@ RogersRicciReactionOp::RogersRicciReactionOp(
    const QuadratureFunction &phi_qf,
    const QuadratureFunction &Sn_qf,
    int num_active,
+   AssemblyLevel asm_level,
    real_t Lambda,
    real_t eps2)
    : Operator(block_offsets.Last()),
@@ -54,6 +55,10 @@ RogersRicciReactionOp::RogersRicciReactionOp(
       auto *integ = new DomainLFIntegrator(qfc);
       integ->SetIntRule(&ir);
       lf->AddDomainIntegrator(integ);
+      // Device-resident assembly of the QuadratureFunctionCoefficient residual;
+      // without this the (device-computed) QF is copied back to host and
+      // integrated on the CPU every residual evaluation.
+      lf->UseFastAssembly(true);
       return lf;
    };
    _lf_T     = make_lf(_F_T_qfc);
@@ -67,7 +72,7 @@ RogersRicciReactionOp::RogersRicciReactionOp(
       auto *integ = new MassIntegrator(qfc);
       integ->SetIntRule(&ir);
       bf->AddDomainIntegrator(integ);
-      bf->SetAssemblyLevel(AssemblyLevel::PARTIAL);
+      bf->SetAssemblyLevel(asm_level);
       return bf;
    };
    _bf_TT = make_bf(_dFT_dT_qfc);
@@ -223,9 +228,12 @@ void RogersRicciReactionOp::computeReactionJacobianAtQPs() const
 
 Ricci2DNonlinear::Ricci2DNonlinear(MPI_Comm comm, int order, int ref_levels,
                                    real_t xL, real_t yL, int num_active,
+                                   bool matrix_free, bool phi_lor,
                                    const std::string &save_dir)
    : _xL(xL), _yL(yL), _order(order), _ref_levels(ref_levels),
      _num_active(num_active),
+     _matrix_free(matrix_free),
+     _phi_lor(phi_lor),
      _rotmat({{0.0, -1.0}, {1.0, 0.0}}),
      _comm(comm),
      _save_dir(save_dir)
@@ -383,9 +391,23 @@ void Ricci2DNonlinear::buildMassMatrix()
 {
    _M_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
    _M_form->AddDomainIntegrator(new MassIntegrator);
-   _M_form->Assemble();
-   _M_form->Finalize();
-   _M_mat.reset(_M_form->ParallelAssemble());
+
+   if (_matrix_free)
+   {
+      _M_form->SetAssemblyLevel(AssemblyLevel::PARTIAL);
+      _M_form->Assemble();
+      Array<int> empty_ess;
+      _M_form->FormSystemMatrix(empty_ess, _M_op);
+      _M_diag.SetSize(_h1_fes->GetTrueVSize());
+      _M_diag.UseDevice(true);
+      _M_form->AssembleDiagonal(_M_diag);
+   }
+   else
+   {
+      _M_form->Assemble();
+      _M_form->Finalize();
+      _M_mat.reset(_M_form->ParallelAssemble());
+   }
 }
 
 void Ricci2DNonlinear::buildKForm()
@@ -396,6 +418,14 @@ void Ricci2DNonlinear::buildKForm()
    _K_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
    _K_form->AddDomainIntegrator(new ConvectionIntegrator(*_vd, -_Binv));
    _K_form->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef));
+   if (_matrix_free)
+   {
+      _K_form->SetAssemblyLevel(AssemblyLevel::PARTIAL);
+      // Companion form (SUW diffusion only) for the Jacobi diagonal of K.
+      _K_diff_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
+      _K_diff_form->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef));
+      _K_diff_form->SetAssemblyLevel(AssemblyLevel::PARTIAL);
+   }
 }
 
 void Ricci2DNonlinear::buildPhiSolver()
@@ -406,27 +436,55 @@ void Ricci2DNonlinear::buildPhiSolver()
 
    _a_phi = std::make_unique<ParBilinearForm>(_h1_fes.get());
    _a_phi->AddDomainIntegrator(new DiffusionIntegrator());
-   _a_phi->Assemble();
-   _a_phi->Finalize();
+   if (_phi_lor)
+   {
+      _a_phi->SetAssemblyLevel(AssemblyLevel::PARTIAL);
+      _a_phi->Assemble();
+   }
+   else
+   {
+      _a_phi->Assemble();
+      _a_phi->Finalize();
+   }
 
    _omega_coef = std::make_unique<GridFunctionCoefficient>(
                         _vars[OMEGA_IDX].get());
    _neg_omega_coef = std::make_unique<ProductCoefficient>(-1.0, *_omega_coef);
    _b_phi = std::make_unique<ParLinearForm>(_h1_fes.get());
    _b_phi->AddDomainIntegrator(new DomainLFIntegrator(*_neg_omega_coef));
+   _b_phi->UseFastAssembly(true);
 
    _a_phi->FormSystemMatrix(_ess_tdof_list_phi, _A_phi);
 
-   _amg_phi = std::make_unique<HypreBoomerAMG>();
+   // Preconditioner: BoomerAMG on the LOR low-order Laplacian (phi_lor) or on
+   // the assembled high-order Laplacian.  The Laplacian is constant, so the LOR
+   // matrix and AMG setup are built once.  The LOR AMG is built via the
+   // HypreParMatrix constructor (not LORSolver / SetOperator).
+   if (_phi_lor)
+   {
+      _lor_disc = std::make_unique<ParLORDiscretization>(
+                     *_a_phi, _ess_tdof_list_phi);
+      _amg_phi = std::make_unique<HypreBoomerAMG>(
+                     _lor_disc->GetAssembledMatrix());
+   }
+   else
+   {
+      _amg_phi = std::make_unique<HypreBoomerAMG>();
+      _amg_phi->SetOperator(*_A_phi);
+   }
    _amg_phi->SetPrintLevel(0);
-   _amg_phi->SetOperator(*_A_phi);
+   Solver *phi_prec = _amg_phi.get();
 
    _cg_phi = std::make_unique<CGSolver>(_comm);
    _cg_phi->SetRelTol(1e-12);
    _cg_phi->SetMaxIter(2000);
    _cg_phi->SetPrintLevel(0);
-   _cg_phi->SetPreconditioner(*_amg_phi);
+   // Set the operator before the preconditioner: IterativeSolver::SetOperator
+   // forwards its operator to the preconditioner, which would hand the
+   // matrix-free PA Laplacian to BoomerAMG (it requires a HypreParMatrix).  The
+   // AMG operand is already bound (LOR matrix or assembled Laplacian) above.
    _cg_phi->SetOperator(*_A_phi);
+   _cg_phi->SetPreconditioner(*phi_prec);
 }
 
 void Ricci2DNonlinear::buildNonlinearForm()
@@ -434,7 +492,9 @@ void Ricci2DNonlinear::buildNonlinearForm()
    _reaction_op = std::make_unique<RogersRicciReactionOp>(
       *_h1_fes, *_qspace, _qspace->GetIntRule(0),
       _block_trueOffsets, *_phi_qf, *_Sn_qf,
-      _num_active, _Lambda, _eps2);
+      _num_active,
+      _matrix_free ? AssemblyLevel::PARTIAL : AssemblyLevel::LEGACY,
+      _Lambda, _eps2);
 }
 
 void Ricci2DNonlinear::setInitialConditions()
@@ -610,11 +670,26 @@ void Ricci2DNonlinear::updatePhi()
 
 void Ricci2DNonlinear::reassembleK()
 {
-   // Refresh the K matrix with the new V_d, V_E, phi values
+   // Refresh K with the new V_d, V_E, phi values.
    _K_form->Update();
    _K_form->Assemble();
-   _K_form->Finalize();
-   _K_mat.reset(_K_form->ParallelAssemble());
+
+   if (_matrix_free)
+   {
+      Array<int> empty_ess;
+      _K_form->FormSystemMatrix(empty_ess, _K_op);
+      // Jacobi diagonal from the SUW-diffusion companion (convection omitted).
+      _K_diff_form->Update();
+      _K_diff_form->Assemble();
+      _K_diag.SetSize(_h1_fes->GetTrueVSize());
+      _K_diag.UseDevice(true);
+      _K_diff_form->AssembleDiagonal(_K_diag);
+   }
+   else
+   {
+      _K_form->Finalize();
+      _K_mat.reset(_K_form->ParallelAssemble());
+   }
 }
 
 void Ricci2DNonlinear::updateDataCollection(int step, real_t t)
@@ -646,9 +721,19 @@ void RicciImplicitStageOp::SetParameters(real_t gamma, const BlockVector &u_pred
    _gamma = gamma;
    _u_pred = &u_pred;
 
-   HypreParMatrix *M = _ricci.MassMat();
-   HypreParMatrix *K = _ricci.KMat();
-   _M_plus_gK.reset(Add(1.0, *M, _gamma, *K));
+   if (_ricci.MatrixFree())
+   {
+      // Matrix-free M + γK: a SumOperator over the PA M and K operators.
+      _M_plus_gK_mf = std::make_unique<SumOperator>(
+         _ricci.MassOp(), 1.0, _ricci.KOp(), _gamma,
+         /*ownA=*/false, /*ownB=*/false);
+   }
+   else
+   {
+      HypreParMatrix *M = _ricci.MassMatHypre();
+      HypreParMatrix *K = _ricci.KMatHypre();
+      _M_plus_gK_hypre.reset(Add(1.0, *M, _gamma, *K));
+   }
 }
 
 void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
@@ -667,8 +752,8 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
    BlockVector k_blk(const_cast<Vector&>(k_vec), offs);
    BlockVector R_blk(R_vec, offs);
 
-   HypreParMatrix *M = _ricci.MassMat();
-   HypreParMatrix *K = _ricci.KMat();
+   Operator *M = _ricci.MassOp();
+   Operator *K = _ricci.KOp();
    for (int s = 0; s < NUM_VARS; ++s)
    {
       M->Mult(k_blk.GetBlock(s), _tmp_block);
@@ -690,9 +775,9 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
    // PA F'_* blocks (unscaled)
    BlockOperator &Fgrad = _ricci.ReactionOp()->GetGradient(_z);
 
-   const int       n_active = _ricci.NumActive();
-   HypreParMatrix *M        = _ricci.MassMat();
-   HypreParMatrix *MgK      = _M_plus_gK.get();   // built in SetParameters
+   const int  n_active = _ricci.NumActive();
+   Operator  *M        = _ricci.MassOp();
+   Operator  *MgK      = MassPlusGammaK();   // built in SetParameters
 
    // T row is always active.
    _diag_T = std::make_unique<SumOperator>(MgK, 1.0,
@@ -759,21 +844,26 @@ public:
 
       const real_t sigma = 1e-4;
       const int max_tries = 20;
-      Vector x_trial(x.Size()), r_trial(r.Size());
+      // Device-resident scratch, sized once and reused across Newton iters.
+      _x_trial.SetSize(x.Size()); _x_trial.UseDevice(true);
+      _r_trial.SetSize(r.Size()); _r_trial.UseDevice(true);
       real_t alpha = 1.0;
 
       for (int i = 0; i < max_tries; ++i)
       {
-         add(x, -alpha, c, x_trial);
-         oper->Mult(x_trial, r_trial);
-         if (b.Size() == r_trial.Size()) { r_trial -= b; }
-         const real_t norm_trial = Norm(r_trial);
+         add(x, -alpha, c, _x_trial);
+         oper->Mult(_x_trial, _r_trial);
+         if (b.Size() == _r_trial.Size()) { _r_trial -= b; }
+         const real_t norm_trial = Norm(_r_trial);
          if (norm_trial <= (1.0 - sigma * alpha) * norm0) { return alpha; }
          alpha *= 0.5;
       }
       // Couldn't satisfy Armijo; return the smallest tried
       return alpha;
    }
+
+private:
+   mutable Vector _x_trial, _r_trial;
 };
 
 // Block Krylov solver consumed by NewtonSolver as its linear solver.
@@ -781,10 +871,12 @@ class BlockNewtonLinearSolver : public IterativeSolver
 {
 public:
    BlockNewtonLinearSolver(MPI_Comm comm,
+                           bool matrix_free,
                            real_t rtol = 1e-10,
                            int max_it = 200,
                            int kdim = 50)
       : IterativeSolver(comm),
+        _matrix_free(matrix_free),
         _gmres(comm)
    {
       SetRelTol(rtol);
@@ -792,14 +884,19 @@ public:
       SetMaxIter(max_it);
       _gmres.SetKDim(kdim);
       _gmres.SetPrintLevel(0);
-      _amgs.resize(NUM_VARS);
-      for (int s = 0; s < NUM_VARS; ++s)
+      _jacobi.resize(NUM_VARS);   // matrix-free: built lazily per stage
+      if (!_matrix_free)
       {
-         _amgs[s] = std::make_unique<HypreBoomerAMG>();
-         _amgs[s]->SetPrintLevel(0);
+         _amgs.resize(NUM_VARS);
+         for (int s = 0; s < NUM_VARS; ++s)
+         {
+            _amgs[s] = std::make_unique<HypreBoomerAMG>();
+            _amgs[s]->SetPrintLevel(0);
+         }
       }
    }
 
+   // Legacy path: pin the AMG hierarchies to the assembled (M+γK)/M operands.
    void SetPrecondOperands(HypreParMatrix &M,
                            HypreParMatrix &M_plus_gK,
                            int num_active)
@@ -807,6 +904,17 @@ public:
       _amgs[T_IDX]->SetOperator(M_plus_gK);
       _amgs[OMEGA_IDX]->SetOperator((num_active >= 2) ? M_plus_gK : M);
       _amgs[N_IDX]->SetOperator((num_active >= 3) ? M_plus_gK : M);
+   }
+
+   // Matrix-free path: (re)load the per-block Jacobi diagonals.  The γ·F'
+   // diagonal contribution is intentionally omitted, matching the legacy AMG
+   // preconditioner which is built on M+γK only.
+   void SetPrecondDiagonals(const Vector &d_T, const Vector &d_w,
+                            const Vector &d_n)
+   {
+      refreshJacobi(T_IDX,     d_T);
+      refreshJacobi(OMEGA_IDX, d_w);
+      refreshJacobi(N_IDX,     d_n);
    }
 
    void SetOperator(const Operator &op) override
@@ -821,7 +929,11 @@ public:
          _bdp = std::make_unique<BlockDiagonalPreconditioner>(bop->RowOffsets());
 
          for (int s = 0; s < NUM_VARS; ++s)
-            _bdp->SetDiagonalBlock(s, _amgs[s].get());
+         {
+            Solver *prec = _matrix_free ? (Solver*)_jacobi[s].get()
+                                        : (Solver*)_amgs[s].get();
+            _bdp->SetDiagonalBlock(s, prec);
+         }
 
          _gmres.SetPreconditioner(*_bdp);
       }
@@ -841,10 +953,20 @@ public:
    }
 
 private:
+   void refreshJacobi(int s, const Vector &d)
+   {
+      if (!_jacobi[s])
+         _jacobi[s] = std::make_unique<OperatorJacobiSmoother>(d, _empty_ess);
+      else
+         _jacobi[s]->Setup(d);
+   }
 
+   bool                                         _matrix_free;
    mutable GMRESSolver                          _gmres;
    std::unique_ptr<BlockDiagonalPreconditioner> _bdp;
-   std::vector<std::unique_ptr<HypreBoomerAMG>> _amgs;
+   std::vector<std::unique_ptr<HypreBoomerAMG>> _amgs;       // legacy path
+   std::vector<std::unique_ptr<OperatorJacobiSmoother>> _jacobi; // matrix-free
+   Array<int>                                   _empty_ess;
 };
 
 } // anonymous namespace
@@ -859,8 +981,8 @@ RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear & ricci,
      _ricci(ricci),
      _stage_op(ricci),
      _newton(new BacktrackingNewtonSolver(comm)),
-     _lin_solver(new BlockNewtonLinearSolver(comm, lin_rtol,
-                                             lin_max_iter, kdim))
+     _lin_solver(new BlockNewtonLinearSolver(comm, ricci.MatrixFree(),
+                                             lin_rtol, lin_max_iter, kdim))
 {
    _newton->iterative_mode = false;
    _newton->SetSolver(*_lin_solver);
@@ -895,9 +1017,27 @@ void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
    MFEM_VERIFY(block_solver,
                "RicciTimeOperator: linear solver is not a "
                "BlockNewtonLinearSolver.");
-   block_solver->SetPrecondOperands(*_ricci.MassMat(),
-                                     *_stage_op.MassPlusGammaK(),
-                                     _ricci.NumActive());
+
+   if (_ricci.MatrixFree())
+   {
+      // Per-block Jacobi diagonals: diag(M)+γ·diag(K) on active rows, diag(M)
+      // on frozen rows.  (γ·F' diagonal omitted, matching the legacy AMG.)
+      const int na = _ricci.NumActive();
+      const Vector &dM = _ricci.MassDiag();
+      const Vector &dK = _ricci.KDiag();
+      Vector d_T(dM.Size()), d_w(dM.Size()), d_n(dM.Size());
+      d_T.UseDevice(true); d_w.UseDevice(true); d_n.UseDevice(true);
+      add(dM, gamma, dK, d_T);
+      if (na >= 2) { add(dM, gamma, dK, d_w); } else { d_w = dM; }
+      if (na >= 3) { add(dM, gamma, dK, d_n); } else { d_n = dM; }
+      block_solver->SetPrecondDiagonals(d_T, d_w, d_n);
+   }
+   else
+   {
+      block_solver->SetPrecondOperands(*_ricci.MassMatHypre(),
+                                       *_stage_op.MassPlusGammaKHypre(),
+                                       _ricci.NumActive());
+   }
 
    k = 0.0;
    Vector zero;
@@ -932,6 +1072,8 @@ int main(int argc, char *argv[])
    real_t ew_rtol_max       = 0.9;
    int    num_active        = NUM_VARS;
    int    vis_steps         = 1;
+   std::string assembly_level = "partial";
+   bool   phi_lor           = false;
    std::string save_dir = "Ricci2DNonlinear";
 
    OptionsParser args(argc, argv);
@@ -971,6 +1113,15 @@ int main(int argc, char *argv[])
                   "2 = T and omega, 3 = T, omega, and n (full system).");
    args.AddOption(&vis_steps, "-vs", "--visualization-steps",
                   "Save ParaView output every N steps.");
+   args.AddOption(&assembly_level, "-al", "--assembly-level",
+                  "Assembly level for the block operators M, K, and F': "
+                  "'partial' = matrix-free PA + Jacobi block preconditioner "
+                  "(GPU-friendly), 'legacy' = assembled HypreParMatrix + "
+                  "BoomerAMG.");
+   args.AddOption(&phi_lor, "-lor", "--phi-lor", "-no-lor", "--no-phi-lor",
+                  "Solve the phi Poisson problem with a PA operator "
+                  "preconditioned by LOR-AMG (on) or an assembled Laplacian "
+                  "with BoomerAMG (off).");
    args.AddOption(&save_dir, "-sd", "--save-directory",
                   "Top-level output directory.  ParaView frames are written "
                   "to <save_dir>/Step/, single-slot checkpoint state to "
@@ -986,6 +1137,19 @@ int main(int argc, char *argv[])
       return 1;
    }
    if (myid == 0) { args.PrintOptions(std::cout); }
+
+   bool matrix_free = true;
+   if (assembly_level == "legacy")       { matrix_free = false; }
+   else if (assembly_level == "partial") { matrix_free = true; }
+   else
+   {
+      if (myid == 0)
+      {
+         std::cout << "Unknown --assembly-level '" << assembly_level
+                   << "'; expected 'partial' or 'legacy'." << std::endl;
+      }
+      return 1;
+   }
 
    Device device(device_config);
    if (myid == 0) { device.Print(); }
@@ -1018,7 +1182,7 @@ int main(int argc, char *argv[])
    }
 
    Ricci2DNonlinear ricci(MPI_COMM_WORLD, order, ref_levels, xL, yL,
-                          num_active, save_dir);
+                          num_active, matrix_free, phi_lor, save_dir);
    ricci.Setup(restart ? cdir : "");
 
    ricci.syncGridFuncsFromBlocks(*ricci.StateBlocks());
