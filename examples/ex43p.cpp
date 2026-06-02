@@ -1109,6 +1109,7 @@ int main(int argc, char *argv[])
    int    vis_steps         = 1;
    std::string assembly_level = "partial";
    bool   phi_lor           = false;
+   bool   gpu_aware_mpi     = false;
    std::string save_dir = "Ricci2DNonlinear";
 
    OptionsParser args(argc, argv);
@@ -1153,6 +1154,13 @@ int main(int argc, char *argv[])
                   "'partial' = matrix-free PA + Jacobi block preconditioner "
                   "(GPU-friendly), 'legacy' = assembled HypreParMatrix + "
                   "BoomerAMG.");
+   args.AddOption(&gpu_aware_mpi, "-gpumpi", "--gpu-aware-mpi",
+                  "-no-gpumpi", "--no-gpu-aware-mpi",
+                  "Tell MFEM the linked MPI is GPU-aware: parallel exchanges "
+                  "(e.g. P/P^T inside ParallelAssemble/ParallelProject) pass "
+                  "device pointers directly to MPI instead of staging through "
+                  "host memory.  Requires both the MPI runtime and (for any "
+                  "Hypre traffic) Hypre itself to be GPU-aware-MPI-capable.");
    args.AddOption(&phi_lor, "-lor", "--phi-lor", "-no-lor", "--no-phi-lor",
                   "Solve the phi Poisson problem with a PA operator "
                   "preconditioned by LOR-AMG (on) or an assembled Laplacian "
@@ -1187,6 +1195,7 @@ int main(int argc, char *argv[])
    }
 
    Device device(device_config);
+   if (gpu_aware_mpi) { Device::SetGPUAwareMPI(true); }
    if (myid == 0) { device.Print(); }
 
    // The checkpoint directory is a fixed subfolder of the save directory.

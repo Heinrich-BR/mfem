@@ -847,6 +847,7 @@ int main(int argc, char *argv[])
    real_t ew_rtol_max       = 0.9;
    int    num_active        = NUM_VARS;
    int    vis_steps         = 1;
+   bool   gpu_aware_mpi     = false;
    std::string save_dir = "Ricci2DNonlinear";
 
    OptionsParser args(argc, argv);
@@ -886,6 +887,13 @@ int main(int argc, char *argv[])
                   "2 = T and omega, 3 = T, omega, and n (full system).");
    args.AddOption(&vis_steps, "-vs", "--visualization-steps",
                   "Save ParaView output every N steps.");
+   args.AddOption(&gpu_aware_mpi, "-gpumpi", "--gpu-aware-mpi",
+                  "-no-gpumpi", "--no-gpu-aware-mpi",
+                  "Tell MFEM the linked MPI is GPU-aware: parallel exchanges "
+                  "(e.g. P/P^T inside ParallelAssemble/ParallelProject) pass "
+                  "device pointers directly to MPI instead of staging through "
+                  "host memory.  Requires both the MPI runtime and (for any "
+                  "Hypre traffic) Hypre itself to be GPU-aware-MPI-capable.");
    args.AddOption(&save_dir, "-sd", "--save-directory",
                   "Top-level output directory.  ParaView frames are written "
                   "to <save_dir>/Step/, single-slot checkpoint state to "
@@ -903,6 +911,7 @@ int main(int argc, char *argv[])
    if (myid == 0) { args.PrintOptions(std::cout); }
 
    Device device(device_config);
+   if (gpu_aware_mpi) { Device::SetGPUAwareMPI(true); }
    if (myid == 0) { device.Print(); }
 
    // The checkpoint directory is a fixed subfolder of the save directory.
