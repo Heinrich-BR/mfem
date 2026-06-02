@@ -372,6 +372,8 @@ SumOperator::SumOperator(const Operator *A, const real_t alpha,
      A(A), B(B), alpha(alpha), beta(beta), ownA(ownA), ownB(ownB),
      z(A->Height())
 {
+   z.UseDevice(true);
+
    MFEM_VERIFY(A->Width() == B->Width(),
                "incompatible Operators: different widths\n"
                << "A->Width() = " << A->Width()
