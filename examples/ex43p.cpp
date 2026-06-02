@@ -100,6 +100,11 @@ void RogersRicciReactionOp::Mult(const Vector &z_true, Vector &R_true) const
    BlockVector R_blk(R_true, _block_offsets);
    R_blk.UseDevice(true);
    for (int s = 0; s < NUM_VARS; ++s) { R_blk.GetBlock(s).UseDevice(true); }
+   // Propagate the parent's Memory-validity flags to the block aliases before
+   // writing through them; without this, on-device writes to a single block
+   // leave the parent's flags stale and a subsequent read of R_true triggers a
+   // spurious host->device sync that clobbers the alias writes.
+   R_blk.SyncToBlocks();
 
    _lf_T->ParallelAssemble(R_blk.GetBlock(T_IDX));
 
@@ -112,6 +117,10 @@ void RogersRicciReactionOp::Mult(const Vector &z_true, Vector &R_true) const
       _lf_n->ParallelAssemble(R_blk.GetBlock(N_IDX));
    else
       R_blk.GetBlock(N_IDX) = 0.0;
+
+   // Push the (now-correct) block validity flags back into the parent so the
+   // caller sees a consistent R_true.
+   R_blk.SyncFromBlocks();
 }
 
 BlockOperator &RogersRicciReactionOp::GetGradient(const Vector &z_true) const
@@ -149,7 +158,13 @@ BlockOperator &RogersRicciReactionOp::GetGradient(const Vector &z_true) const
 
 void RogersRicciReactionOp::sampleStateToQPs(const Vector &z_true) const
 {
+   const_cast<Vector&>(z_true).UseDevice(true);
    BlockVector z_blk(const_cast<Vector&>(z_true), _block_offsets);
+   z_blk.UseDevice(true);
+   for (int s = 0; s < NUM_VARS; ++s) { z_blk.GetBlock(s).UseDevice(true); }
+   // Propagate the parent's Memory-validity flags to the aliases before reading
+   // them; otherwise a block read on device may pull stale host data.
+   z_blk.SyncToBlocks();
 
    const Operator *P = _fes.GetProlongationMatrix();
 
@@ -657,6 +672,9 @@ void Ricci2DNonlinear::LoadCheckpointMeta(const std::string &dir,
 
 void Ricci2DNonlinear::syncGridFuncsFromBlocks(const BlockVector &u_blk)
 {
+   // Block aliases need the parent's current validity flags before they are
+   // read on device.
+   u_blk.SyncToBlocks();
    for (int i = 0; i < NUM_VARS; ++i)
       _vars[i]->SetFromTrueDofs(u_blk.GetBlock(i));
 }
@@ -665,10 +683,14 @@ void Ricci2DNonlinear::syncBlocksFromGridFuncs(BlockVector &u_blk) const
 {
    for (int i = 0; i < NUM_VARS; ++i)
       _vars[i]->ParallelProject(u_blk.GetBlock(i));
+   // The writes above updated only the block aliases; propagate their validity
+   // back to the parent so subsequent flat-vector reads of u_blk see them.
+   u_blk.SyncFromBlocks();
 }
 
 void Ricci2DNonlinear::pullOmegaFromBlocks(const BlockVector &u_blk)
 {
+   u_blk.SyncToBlocks();
    _vars[OMEGA_IDX]->SetFromTrueDofs(u_blk.GetBlock(OMEGA_IDX));
 }
 
@@ -765,6 +787,9 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
 
    // z = u_pred + gamma * k
    add(*_u_pred, _gamma, k_vec, _z);
+   // `add` wrote to _z's parent storage but its block aliases (used below via
+   // `_z.GetBlock(s)` for K->Mult) still carry stale validity flags.
+   _z.SyncToBlocks();
 
    // R = F(z)
    _ricci.ReactionOp()->Mult(_z, R_vec);
@@ -780,6 +805,11 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
       k_blk.GetBlock(s).UseDevice(true);
       R_blk.GetBlock(s).UseDevice(true);
    }
+   // Pull parent validity flags into the block aliases.  R_true was just
+   // written by ReactionOp->Mult above (which already called SyncFromBlocks),
+   // so R_true's flags are authoritative; same for k_vec from the Newton iter.
+   k_blk.SyncToBlocks();
+   R_blk.SyncToBlocks();
 
    Operator *M = _ricci.MassOp();
    Operator *K = _ricci.KOp();
@@ -790,6 +820,10 @@ void RicciImplicitStageOp::Mult(const Vector &k_vec, Vector &R_vec) const
       K->Mult(_z.GetBlock(s), _tmp_block);
       R_blk.GetBlock(s) += _tmp_block;
    }
+
+   // Push the updated block flags back into R_vec so the caller (NewtonSolver)
+   // sees consistent device state.
+   R_blk.SyncFromBlocks();
 }
 
 Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
@@ -800,6 +834,7 @@ Operator &RicciImplicitStageOp::GetGradient(const Vector &k_vec) const
 
    // z = u_pred + gamma * k.
    add(*_u_pred, _gamma, k_vec, _z);
+   _z.SyncToBlocks();
 
    // PA F'_* blocks (unscaled)
    BlockOperator &Fgrad = _ricci.ReactionOp()->GetGradient(_z);
@@ -1044,6 +1079,7 @@ void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
                           _ricci.BlockTrueOffsets());
    u_pred_blk.UseDevice(true);
    for (int s = 0; s < NUM_VARS; ++s) { u_pred_blk.GetBlock(s).UseDevice(true); }
+   u_pred_blk.SyncToBlocks();
 
    _ricci.pullOmegaFromBlocks(u_pred_blk);
    _ricci.updatePhi();
