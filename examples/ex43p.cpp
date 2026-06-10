@@ -1,3 +1,20 @@
+// ex43p: 2D Rogers-Ricci with implicit time stepping, GPU-oriented.
+//
+// Performance notes for large GPU runs:
+//  - Build hypre with GPU support (e.g. spack hypre+cuda); otherwise every
+//    HypreParMatrix/BoomerAMG operation runs on the host with transfers.
+//    The startup banner prints whether hypre is GPU-enabled.
+//  - Defaults are GPU-friendly: -al partial (partial assembly) with
+//    -kcoef device (coefficients of K and the phi RHS sampled at quadrature
+//    points by device kernels; -kcoef legacy keeps the host per-point
+//    evaluation path for validation).
+//  - The phi CG solve warm-starts from the previous stage (-no-phi-warm to
+//    disable) and its tolerance is adjustable (-phitol).
+//  - At scale, raise -vs (ParaView cadence) and set -cs (checkpoint cadence)
+//    so per-rank file I/O does not dominate; prefer higher order (-o 2/3)
+//    with fewer refinements at fixed DoF count, enable -ew and -gpumpi, and
+//    consider SDIRK23 (-s 23).
+
 #include "ex43p.hpp"
 
 RogersRicciReactionOp::RogersRicciReactionOp(
@@ -240,11 +257,13 @@ void RogersRicciReactionOp::computeReactionJacobianAtQPs() const
 Ricci2DNonlinear::Ricci2DNonlinear(MPI_Comm comm, int order, int ref_levels,
                                    real_t xL, real_t yL, int num_active,
                                    bool partial_assembly, bool phi_lor,
+                                   bool device_coeffs,
                                    const std::string &save_dir)
    : _xL(xL), _yL(yL), _order(order), _ref_levels(ref_levels),
      _num_active(num_active),
      _partial_assembly(partial_assembly),
      _phi_lor(phi_lor),
+     _device_coeffs(device_coeffs),
      _rotmat({{0.0, -1.0}, {1.0, 0.0}}),
      _comm(comm),
      _save_dir(save_dir)
@@ -253,6 +272,9 @@ Ricci2DNonlinear::Ricci2DNonlinear(MPI_Comm comm, int order, int ref_levels,
                "Ricci2DNonlinear: num_active must be 1, 2, or 3.");
    MFEM_VERIFY(!save_dir.empty(),
                "Ricci2DNonlinear: save_dir must be non-empty.");
+   MFEM_VERIFY(!device_coeffs || partial_assembly,
+               "Ricci2DNonlinear: -kcoef device requires partial assembly "
+               "(QuadratureFunction coefficients have no pointwise Eval).");
 }
 
 void Ricci2DNonlinear::Setup(const std::string &restart_dir)
@@ -281,6 +303,7 @@ void Ricci2DNonlinear::Setup(const std::string &restart_dir)
    setOutput();
    buildPhiSolver();
    buildKForm();
+   updateKCoefficients();
    reassembleK();
 
    _restart_dir.clear();
@@ -397,12 +420,76 @@ void Ricci2DNonlinear::buildQuadratureSamples()
    _qi_h1 = _h1_fes->GetQuadratureInterpolator(_qspace->GetIntRule(0));
    _phi_e_vec.SetSize(_er_h1->Height());
    _phi_e_vec.UseDevice(true);
+
+   // Unified explicit integration rule for K: the max of the two integrators'
+   // defaults, so accuracy never decreases and both -kcoef modes integrate
+   // with the identical rule (A/B runs differ only by coefficient-evaluation
+   // path).
+   {
+      const FiniteElement &el = *_h1_fes->GetTypicalFE();
+      ElementTransformation *T0 = _pmesh->GetTypicalElementTransformation();
+      const int k_order = std::max(
+         DiffusionIntegrator::GetRule(el, el).GetOrder(),
+         ConvectionIntegrator::GetRule(el, el, *T0).GetOrder());
+      _qspace_K = std::make_unique<QuadratureSpace>(_pmesh.get(), k_order);
+   }
+
+   if (_device_coeffs)
+   {
+      _qi_K = _h1_fes->GetQuadratureInterpolator(_qspace_K->GetIntRule(0));
+      _qi_K->SetOutputLayout(QVectorLayout::byVDIM);
+      _grad_phi_qf = std::make_unique<QuadratureFunction>(*_qspace_K, 2);
+      _vd_qf       = std::make_unique<QuadratureFunction>(*_qspace_K, 2);
+      _suw_qf      = std::make_unique<QuadratureFunction>(*_qspace_K, 3);
+      _vd_qfc      = std::make_unique<VectorQuadratureFunctionCoefficient>(
+                        *_vd_qf);
+      _suw_qf_coef = std::make_unique<QFSymmetricMatrixCoefficient>(
+                        *_suw_qf, _dim);
+
+      _neg_omega_qf  = std::make_unique<QuadratureFunction>(*_qspace);
+      _neg_omega_qfc = std::make_unique<QuadratureFunctionCoefficient>(
+                          *_neg_omega_qf);
+      _omega_e_vec.SetSize(_er_h1->Height());
+      _omega_e_vec.UseDevice(true);
+   }
 }
 
 void Ricci2DNonlinear::projectPhiToQuadrature()
 {
    _er_h1->Mult(*_phi, _phi_e_vec);
    _qi_h1->Values(_phi_e_vec, *_phi_qf);
+}
+
+void Ricci2DNonlinear::updateKCoefficients()
+{
+   if (!_device_coeffs) { return; }
+
+   // grad(phi) at the K quadrature points; _phi_e_vec was refreshed by
+   // projectPhiToQuadrature (the E-vector is integration-rule independent).
+   _qi_K->PhysDerivatives(_phi_e_vec, *_grad_phi_qf);
+
+   const int     nq   = _qspace_K->GetSize();
+   const real_t  Binv = _Binv;
+   const real_t  h    = _h;
+   const real_t  eps2 = _eps2;
+   const real_t *g    = _grad_phi_qf->Read();
+   real_t       *vd   = _vd_qf->Write();
+   real_t       *suw  = _suw_qf->Write();
+
+   mfem::forall(nq, [=] MFEM_HOST_DEVICE (int q)
+   {
+      const real_t gx = g[2*q], gy = g[2*q+1];
+      // v_d = rot * grad(phi), rot = [[0,-1],[1,0]]
+      const real_t vdx = -gy, vdy = gx;
+      vd[2*q]   = vdx;
+      vd[2*q+1] = vdy;
+      // v_E = (1/B) v_d;  SUW tensor s * v_E v_E^T, s = h/(2 sqrt(|v_E|^2+eps^2))
+      const real_t vEx = Binv * vdx, vEy = Binv * vdy;
+      const real_t s = h / (2.0 * sqrt(vEx*vEx + vEy*vEy + eps2));
+      suw[3*q]   = s * vEx * vEx;   // packed symmetric [D00, D01, D11]
+      suw[3*q+1] = s * vEx * vEy;
+      suw[3*q+2] = s * vEy * vEy;
+   });
 }
 
 void Ricci2DNonlinear::buildMassMatrix()
@@ -432,16 +519,40 @@ void Ricci2DNonlinear::buildKForm()
 {
    // Poisson + SUW terms
    // K = -(1/B) (v_d · grad u, v) + (c v_E ⊗ v_E : grad u ⊗ grad v).
-   // The integrators reference the live coefficients owned by Ricci2DNonlinear
+   // -kcoef device: QuadratureFunction-backed coefficients refreshed on device
+   // by updateKCoefficients (CoefficientVector fast path in AssemblePA).
+   // -kcoef legacy: the live host-evaluated coefficient chain owned by
+   // Ricci2DNonlinear.
+   // Both modes use the same explicit rule (that of _qspace_K) so they
+   // integrate identically.
+   const IntegrationRule &ir_K = _qspace_K->GetIntRule(0);
+
+   auto make_conv = [&]() -> ConvectionIntegrator*
+   {
+      auto *integ = _device_coeffs
+                    ? new ConvectionIntegrator(*_vd_qfc, -_Binv)
+                    : new ConvectionIntegrator(*_vd, -_Binv);
+      integ->SetIntRule(&ir_K);
+      return integ;
+   };
+   auto make_diff = [&]() -> DiffusionIntegrator*
+   {
+      auto *integ = _device_coeffs
+                    ? new DiffusionIntegrator(*_suw_qf_coef)
+                    : new DiffusionIntegrator(*_SUW_matcoef);
+      integ->SetIntRule(&ir_K);
+      return integ;
+   };
+
    _K_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
-   _K_form->AddDomainIntegrator(new ConvectionIntegrator(*_vd, -_Binv));
-   _K_form->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef));
+   _K_form->AddDomainIntegrator(make_conv());
+   _K_form->AddDomainIntegrator(make_diff());
    if (_partial_assembly)
    {
       _K_form->SetAssemblyLevel(AssemblyLevel::PARTIAL);
       // Companion form (SUW diffusion only) for the Jacobi diagonal of K.
       _K_diff_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
-      _K_diff_form->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef));
+      _K_diff_form->AddDomainIntegrator(make_diff());
       _K_diff_form->SetAssemblyLevel(AssemblyLevel::PARTIAL);
    }
 }
@@ -469,7 +580,18 @@ void Ricci2DNonlinear::buildPhiSolver()
                         _vars[OMEGA_IDX].get());
    _neg_omega_coef = std::make_unique<ProductCoefficient>(-1.0, *_omega_coef);
    _b_phi = std::make_unique<ParLinearForm>(_h1_fes.get());
-   _b_phi->AddDomainIntegrator(new DomainLFIntegrator(*_neg_omega_coef));
+   if (_device_coeffs)
+   {
+      // -omega sampled at QPs on device in updatePhi; the integrator's rule
+      // must match the QuadratureFunction's space for the device fast path.
+      auto *lf_integ = new DomainLFIntegrator(*_neg_omega_qfc);
+      lf_integ->SetIntRule(&_qspace->GetIntRule(0));
+      _b_phi->AddDomainIntegrator(lf_integ);
+   }
+   else
+   {
+      _b_phi->AddDomainIntegrator(new DomainLFIntegrator(*_neg_omega_coef));
+   }
    _b_phi->UseFastAssembly(true);
 
    _a_phi->FormSystemMatrix(_ess_tdof_list_phi, _A_phi);
@@ -490,11 +612,14 @@ void Ricci2DNonlinear::buildPhiSolver()
    Solver *phi_prec = _amg_phi.get();
 
    _cg_phi = std::make_unique<CGSolver>(_comm);
-   _cg_phi->SetRelTol(1e-12);
+   _cg_phi->SetRelTol(_phi_rtol);
    _cg_phi->SetMaxIter(2000);
    _cg_phi->SetPrintLevel(0);
    _cg_phi->SetOperator(*_A_phi);
    _cg_phi->SetPreconditioner(*phi_prec);
+   // Warm start: keep the previous stage's phi as the initial CG iterate
+   // (phi changes slowly between stages; the converged answer is unchanged).
+   _cg_phi->iterative_mode = _phi_warm;
 }
 
 void Ricci2DNonlinear::buildNonlinearForm()
@@ -671,11 +796,21 @@ void Ricci2DNonlinear::pullOmegaFromBlocks(const BlockVector &u_blk)
 
 void Ricci2DNonlinear::updatePhi()
 {
+   if (_device_coeffs)
+   {
+      // Sample -omega at the QPs on device: L -> E -> Q, then negate.
+      _er_h1->Mult(*_vars[OMEGA_IDX], _omega_e_vec);
+      _qi_h1->Values(_omega_e_vec, *_neg_omega_qf);
+      _neg_omega_qf->Neg();
+   }
+
    _b_phi->Assemble();
 
    OperatorPtr A;
    Vector X, B;
-   _a_phi->FormLinearSystem(_ess_tdof_list_phi, *_phi, *_b_phi, A, X, B);
+   // copy_interior = 1 keeps the previous phi in X as the warm-start iterate.
+   _a_phi->FormLinearSystem(_ess_tdof_list_phi, *_phi, *_b_phi, A, X, B,
+                            _phi_warm ? 1 : 0);
 
    _cg_phi->Mult(B, X);
    _a_phi->RecoverFEMSolution(X, *_b_phi, *_phi);
@@ -1020,6 +1155,11 @@ RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear & ricci,
    _newton->SetAbsTol(0.0);
    _newton->SetMaxIter(newton_max_iter);
    _newton->SetPrintLevel(1);
+
+   const int tsize = ricci.H1FES()->GetTrueVSize();
+   _d_T.SetSize(tsize); _d_T.UseDevice(true);
+   _d_w.SetSize(tsize); _d_w.UseDevice(true);
+   _d_n.SetSize(tsize); _d_n.UseDevice(true);
 }
 
 void RicciTimeOperator::EnableEisenstatWalker(real_t rtol0, real_t rtol_max)
@@ -1041,8 +1181,11 @@ void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
 
    _ricci.pullOmegaFromBlocks(u_pred_blk);
    _ricci.updatePhi();
-   _ricci.reassembleK();
+   // projectPhiToQuadrature refreshes the phi E-vector that
+   // updateKCoefficients reuses, so it must run before reassembleK.
    _ricci.projectPhiToQuadrature();
+   _ricci.updateKCoefficients();
+   _ricci.reassembleK();
 
    // Set up M + γK
    _stage_op.SetParameters(gamma, u_pred_blk);
@@ -1060,12 +1203,10 @@ void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
       const int na = _ricci.NumActive();
       const Vector &dM = _ricci.MassDiag();
       const Vector &dK = _ricci.KDiag();
-      Vector d_T(dM.Size()), d_w(dM.Size()), d_n(dM.Size());
-      d_T.UseDevice(true); d_w.UseDevice(true); d_n.UseDevice(true);
-      add(dM, gamma, dK, d_T);
-      if (na >= 2) { add(dM, gamma, dK, d_w); } else { d_w = dM; }
-      if (na >= 3) { add(dM, gamma, dK, d_n); } else { d_n = dM; }
-      block_solver->SetPrecondDiagonals(d_T, d_w, d_n);
+      add(dM, gamma, dK, _d_T);
+      if (na >= 2) { add(dM, gamma, dK, _d_w); } else { _d_w = dM; }
+      if (na >= 3) { add(dM, gamma, dK, _d_n); } else { _d_n = dM; }
+      block_solver->SetPrecondDiagonals(_d_T, _d_w, _d_n);
    }
    else
    {
@@ -1107,8 +1248,12 @@ int main(int argc, char *argv[])
    real_t ew_rtol_max       = 0.9;
    int    num_active        = NUM_VARS;
    int    vis_steps         = 1;
+   int    checkpoint_steps  = 0; // 0 = follow vis_steps
    std::string assembly_level = "partial";
+   std::string kcoef        = "device";
    bool   phi_lor           = false;
+   real_t phi_rtol          = 1e-12;
+   bool   phi_warm          = true;
    bool   gpu_aware_mpi     = false;
    std::string save_dir = "Ricci2DNonlinear";
 
@@ -1149,11 +1294,25 @@ int main(int argc, char *argv[])
                   "2 = T and omega, 3 = T, omega, and n (full system).");
    args.AddOption(&vis_steps, "-vs", "--visualization-steps",
                   "Save ParaView output every N steps.");
+   args.AddOption(&checkpoint_steps, "-cs", "--checkpoint-steps",
+                  "Save a restart checkpoint every N steps "
+                  "(0 = same cadence as --visualization-steps).");
    args.AddOption(&assembly_level, "-al", "--assembly-level",
                   "Assembly level for the block operators M, K, and F': "
                   "'partial' = partial assembly + Jacobi block preconditioner "
                   "(GPU-friendly), 'legacy' = assembled HypreParMatrix + "
                   "BoomerAMG.");
+   args.AddOption(&kcoef, "-kcoef", "--k-coefficients",
+                  "Evaluation of the K and phi-RHS coefficients: 'device' = "
+                  "sampled at quadrature points by device kernels (requires "
+                  "-al partial), 'legacy' = host per-point evaluation "
+                  "(validated path).");
+   args.AddOption(&phi_rtol, "-phitol", "--phi-rtol",
+                  "Relative tolerance of the phi Poisson CG solve.");
+   args.AddOption(&phi_warm, "-phiw", "--phi-warm-start",
+                  "-no-phiw", "--no-phi-warm-start",
+                  "Warm-start the phi CG solve from the previous stage's "
+                  "phi instead of starting from zero.");
    args.AddOption(&gpu_aware_mpi, "-gpumpi", "--gpu-aware-mpi",
                   "-no-gpumpi", "--no-gpu-aware-mpi",
                   "Tell MFEM the linked MPI is GPU-aware");
@@ -1190,9 +1349,38 @@ int main(int argc, char *argv[])
       return 1;
    }
 
+   bool device_coeffs = true;
+   if (kcoef == "legacy")      { device_coeffs = false; }
+   else if (kcoef == "device") { device_coeffs = true; }
+   else
+   {
+      if (myid == 0)
+      {
+         std::cout << "Unknown --k-coefficients '" << kcoef
+                   << "'; expected 'device' or 'legacy'." << std::endl;
+      }
+      return 1;
+   }
+   if (device_coeffs && !partial_assembly)
+   {
+      // QuadratureFunction coefficients have no pointwise Eval; the legacy
+      // assembly level needs the host-evaluated coefficient chain.
+      device_coeffs = false;
+      if (myid == 0)
+      {
+         std::cout << "Note: -al legacy requires -kcoef legacy; "
+                   << "using host coefficient evaluation." << std::endl;
+      }
+   }
+
    Device device(device_config);
    if (gpu_aware_mpi) { Device::SetGPUAwareMPI(true); }
-   if (myid == 0) { device.Print(); }
+   if (myid == 0)
+   {
+      device.Print();
+      std::cout << "hypre GPU support: "
+                << (HypreUsingGPU() ? "yes" : "no") << std::endl;
+   }
 
    // The checkpoint directory is a fixed subfolder of the save directory.
    const std::string cdir = save_dir + "/Checkpoint";
@@ -1222,7 +1410,10 @@ int main(int argc, char *argv[])
    }
 
    Ricci2DNonlinear ricci(MPI_COMM_WORLD, order, ref_levels, xL, yL,
-                          num_active, partial_assembly, phi_lor, save_dir);
+                          num_active, partial_assembly, phi_lor,
+                          device_coeffs, save_dir);
+   ricci._phi_rtol = phi_rtol;
+   ricci._phi_warm = phi_warm;
    ricci.Setup(restart ? cdir : "");
 
    ricci.syncGridFuncsFromBlocks(*ricci.StateBlocks());
@@ -1254,6 +1445,9 @@ int main(int argc, char *argv[])
 
    const real_t t_tol = 1e-12 * std::max(t_final, dt);
 
+   const int cs = (checkpoint_steps > 0) ? checkpoint_steps : vis_steps;
+   Vector phi_tdof(ricci.H1FES()->GetTrueVSize());
+
    const int initial_step = step;
    StopWatch step_timer;
    step_timer.Clear();
@@ -1281,7 +1475,6 @@ int main(int argc, char *argv[])
       const real_t T_norm = gnorm(ricci.StateBlocks()->GetBlock(T_IDX));
       const real_t w_norm = gnorm(ricci.StateBlocks()->GetBlock(OMEGA_IDX));
       const real_t n_norm = gnorm(ricci.StateBlocks()->GetBlock(N_IDX));
-      Vector phi_tdof(ricci.H1FES()->GetTrueVSize());
       ricci.Phi()->ParallelProject(phi_tdof);
       const real_t phi_norm = gnorm(phi_tdof);
 
@@ -1301,6 +1494,9 @@ int main(int argc, char *argv[])
       {
          ricci.updateDataCollection(step, t);
          ricci.Save();
+      }
+      if (step % cs == 0)
+      {
          ricci.SaveCheckpoint(cdir, t, step);
       }
    }

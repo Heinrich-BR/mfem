@@ -9,6 +9,38 @@ using namespace mfem;
 enum VarIdx : int { T_IDX = 0, OMEGA_IDX = 1, N_IDX = 2 };
 constexpr int NUM_VARS = 3;
 
+// Symmetric matrix coefficient backed by a device-resident QuadratureFunction
+// holding the packed entries [D00, D01, D11] (2D) at every quadrature point --
+// the matrix analogue of mfem::VectorQuadratureFunctionCoefficient, which MFEM
+// does not provide.  The PA assembly path consumes it through CoefficientVector
+// with CoefficientStorage::SYMMETRIC, which calls ProjectSymmetric -- here a
+// pure device-to-device copy.  Pointwise Eval (host LEGACY assembly) is
+// intentionally unsupported; use -kcoef legacy for that path.
+class QFSymmetricMatrixCoefficient : public SymmetricMatrixCoefficient
+{
+public:
+   QFSymmetricMatrixCoefficient(const QuadratureFunction &qf, int dim)
+      : SymmetricMatrixCoefficient(dim), _qf(qf) { }
+
+   void ProjectSymmetric(QuadratureFunction &qf) override
+   {
+      MFEM_VERIFY(qf.Size() == _qf.Size(),
+                  "QFSymmetricMatrixCoefficient: quadrature space mismatch "
+                  "(did the integrator's IntegrationRule change?).");
+      qf.Vector::operator=(_qf);
+   }
+
+   void Eval(DenseSymmetricMatrix &, ElementTransformation &,
+             const IntegrationPoint &) override
+   {
+      MFEM_ABORT("QFSymmetricMatrixCoefficient: pointwise Eval not supported; "
+                 "this coefficient requires AssemblyLevel::PARTIAL.");
+   }
+
+private:
+   const QuadratureFunction &_qf;
+};
+
 // Device-native nonlinear reaction operator for the Rogers-Ricci system.
 class RogersRicciReactionOp : public Operator
 {
@@ -92,6 +124,7 @@ public:
                     real_t xL, real_t yL,
                     int num_active,
                     bool partial_assembly, bool phi_lor,
+                    bool device_coeffs,
                     const std::string &save_dir);
    
    void Setup(const std::string &restart_dir);
@@ -106,6 +139,7 @@ public:
    
    void pullOmegaFromBlocks(const BlockVector &u_blk);
    void updatePhi();
+   void updateKCoefficients();
    void reassembleK();
    void updateDataCollection(int step, real_t t);
    void syncGridFuncsFromBlocks(const BlockVector &u_blk);
@@ -147,6 +181,10 @@ public:
    int    _num_active = NUM_VARS;
    bool   _partial_assembly = true; // partial assembly (true) vs assembled+AMG (false)
    bool   _phi_lor     = false; // phi solve: PA + LOR-AMG (true) vs assembled AMG
+   bool   _device_coeffs = true; // K/phi-RHS coefficients sampled on device (true)
+                                 // vs host per-point Eval (false, validated path)
+   real_t _phi_rtol = 1e-12;    // CG tolerance for the phi Poisson solve
+   bool   _phi_warm = true;     // warm-start phi CG from the previous stage
 
 private:
    MPI_Comm _comm;
@@ -229,6 +267,24 @@ private:
    const ElementRestrictionOperator                    *_er_h1 = nullptr;
    const QuadratureInterpolator                        *_qi_h1 = nullptr;
    Vector                                               _phi_e_vec;
+
+   // Device coefficient pipeline for K (-kcoef device).  _qspace_K carries the
+   // unified explicit integration rule used by K's integrators in BOTH -kcoef
+   // modes (max of the Convection/Diffusion defaults).  grad(phi), the drift
+   // velocity v_d, and the packed SUW tensor live at its quadrature points,
+   // device-resident, rebuilt once per implicit stage by updateKCoefficients.
+   std::unique_ptr<QuadratureSpace>                     _qspace_K;
+   const QuadratureInterpolator                        *_qi_K = nullptr;
+   std::unique_ptr<QuadratureFunction>                  _grad_phi_qf;
+   std::unique_ptr<QuadratureFunction>                  _vd_qf;
+   std::unique_ptr<QuadratureFunction>                  _suw_qf;
+   std::unique_ptr<VectorQuadratureFunctionCoefficient> _vd_qfc;
+   std::unique_ptr<QFSymmetricMatrixCoefficient>        _suw_qf_coef;
+   // Device omega sampling for the phi RHS (-kcoef device): -omega at the
+   // quadrature points of _qspace, refreshed in updatePhi.
+   std::unique_ptr<QuadratureFunction>                  _neg_omega_qf;
+   std::unique_ptr<QuadratureFunctionCoefficient>       _neg_omega_qfc;
+   Vector                                               _omega_e_vec;
 
    std::unique_ptr<RogersRicciReactionOp>               _reaction_op;
    std::unique_ptr<ParaViewDataCollection>              _dc;
@@ -316,6 +372,8 @@ private:
    RicciImplicitStageOp _stage_op;
    std::unique_ptr<NewtonSolver>  _newton;
    std::unique_ptr<IterativeSolver> _lin_solver;
+   // Preallocated per-stage Jacobi diagonal scratch (partial assembly path).
+   Vector _d_T, _d_w, _d_n;
 };
 
 #endif // MFEM_EX43P_HPP
