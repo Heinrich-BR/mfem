@@ -239,11 +239,11 @@ void RogersRicciReactionOp::computeReactionJacobianAtQPs() const
 
 Ricci2DNonlinear::Ricci2DNonlinear(MPI_Comm comm, int order, int ref_levels,
                                    real_t xL, real_t yL, int num_active,
-                                   bool matrix_free, bool phi_lor,
+                                   bool partial_assembly, bool phi_lor,
                                    const std::string &save_dir)
    : _xL(xL), _yL(yL), _order(order), _ref_levels(ref_levels),
      _num_active(num_active),
-     _matrix_free(matrix_free),
+     _partial_assembly(partial_assembly),
      _phi_lor(phi_lor),
      _rotmat({{0.0, -1.0}, {1.0, 0.0}}),
      _comm(comm),
@@ -410,7 +410,7 @@ void Ricci2DNonlinear::buildMassMatrix()
    _M_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
    _M_form->AddDomainIntegrator(new MassIntegrator);
 
-   if (_matrix_free)
+   if (_partial_assembly)
    {
       _M_form->SetAssemblyLevel(AssemblyLevel::PARTIAL);
       _M_form->Assemble();
@@ -436,7 +436,7 @@ void Ricci2DNonlinear::buildKForm()
    _K_form = std::make_unique<ParBilinearForm>(_h1_fes.get());
    _K_form->AddDomainIntegrator(new ConvectionIntegrator(*_vd, -_Binv));
    _K_form->AddDomainIntegrator(new DiffusionIntegrator(*_SUW_matcoef));
-   if (_matrix_free)
+   if (_partial_assembly)
    {
       _K_form->SetAssemblyLevel(AssemblyLevel::PARTIAL);
       // Companion form (SUW diffusion only) for the Jacobi diagonal of K.
@@ -503,7 +503,7 @@ void Ricci2DNonlinear::buildNonlinearForm()
       *_h1_fes, *_qspace, _qspace->GetIntRule(0),
       _block_trueOffsets, *_phi_qf, *_Sn_qf,
       _num_active,
-      _matrix_free ? AssemblyLevel::PARTIAL : AssemblyLevel::LEGACY,
+      _partial_assembly ? AssemblyLevel::PARTIAL : AssemblyLevel::LEGACY,
       _Lambda, _eps2);
 }
 
@@ -687,7 +687,7 @@ void Ricci2DNonlinear::reassembleK()
    _K_form->Update();
    _K_form->Assemble();
 
-   if (_matrix_free)
+   if (_partial_assembly)
    {
       Array<int> empty_ess;
       _K_form->FormSystemMatrix(empty_ess, _K_op);
@@ -733,10 +733,10 @@ void RicciImplicitStageOp::SetParameters(real_t gamma, const BlockVector &u_pred
    _gamma = gamma;
    _u_pred = &u_pred;
 
-   if (_ricci.MatrixFree())
+   if (_ricci.PartialAssembly())
    {
-      // Matrix-free M + γK
-      _M_plus_gK_mf = std::make_unique<SumOperator>(
+      // Partial-assembly M + γK
+      _M_plus_gK_pa = std::make_unique<SumOperator>(
          _ricci.MassOp(), 1.0, _ricci.KOp(), _gamma,
          /*ownA=*/false, /*ownB=*/false);
    }
@@ -900,12 +900,12 @@ class BlockNewtonLinearSolver : public IterativeSolver
 {
 public:
    BlockNewtonLinearSolver(MPI_Comm comm,
-                           bool matrix_free,
+                           bool partial_assembly,
                            real_t rtol = 1e-10,
                            int max_it = 200,
                            int kdim = 50)
       : IterativeSolver(comm),
-        _matrix_free(matrix_free),
+        _partial_assembly(partial_assembly),
         _gmres(comm)
    {
       SetRelTol(rtol);
@@ -914,7 +914,7 @@ public:
       _gmres.SetKDim(kdim);
       _gmres.SetPrintLevel(0);
       _jacobi.resize(NUM_VARS);
-      if (!_matrix_free)
+      if (!_partial_assembly)
       {
          _amgs.resize(NUM_VARS);
          for (int s = 0; s < NUM_VARS; ++s)
@@ -956,7 +956,7 @@ public:
 
          for (int s = 0; s < NUM_VARS; ++s)
          {
-            Solver *prec = _matrix_free ? (Solver*)_jacobi[s].get()
+            Solver *prec = _partial_assembly ? (Solver*)_jacobi[s].get()
                                         : (Solver*)_amgs[s].get();
             _bdp->SetDiagonalBlock(s, prec);
          }
@@ -990,11 +990,11 @@ private:
          _jacobi[s]->Setup(d);
    }
 
-   bool                                         _matrix_free;
+   bool                                         _partial_assembly;
    mutable GMRESSolver                          _gmres;
    std::unique_ptr<BlockDiagonalPreconditioner> _bdp;
    std::vector<std::unique_ptr<HypreBoomerAMG>> _amgs;       // legacy path
-   std::vector<std::unique_ptr<OperatorJacobiSmoother>> _jacobi; // matrix-free
+   std::vector<std::unique_ptr<OperatorJacobiSmoother>> _jacobi; // partial assembly
    Array<int>                                   _empty_ess;
 };
 
@@ -1010,7 +1010,7 @@ RicciTimeOperator::RicciTimeOperator(MPI_Comm comm, Ricci2DNonlinear & ricci,
      _ricci(ricci),
      _stage_op(ricci),
      _newton(new BacktrackingNewtonSolver(comm)),
-     _lin_solver(new BlockNewtonLinearSolver(comm, ricci.MatrixFree(),
+     _lin_solver(new BlockNewtonLinearSolver(comm, ricci.PartialAssembly(),
                                              lin_rtol, lin_max_iter, kdim))
 {
    _newton->iterative_mode = false;
@@ -1053,7 +1053,7 @@ void RicciTimeOperator::ImplicitSolve(real_t gamma, const Vector &u_pred,
                "RicciTimeOperator: linear solver is not a "
                "BlockNewtonLinearSolver.");
 
-   if (_ricci.MatrixFree())
+   if (_ricci.PartialAssembly())
    {
       // Per-block Jacobi diagonals: diag(M)+γ·diag(K) on active rows, diag(M)
       // on frozen rows.  (γ·F' diagonal omitted, matching the legacy AMG.)
@@ -1151,7 +1151,7 @@ int main(int argc, char *argv[])
                   "Save ParaView output every N steps.");
    args.AddOption(&assembly_level, "-al", "--assembly-level",
                   "Assembly level for the block operators M, K, and F': "
-                  "'partial' = matrix-free PA + Jacobi block preconditioner "
+                  "'partial' = partial assembly + Jacobi block preconditioner "
                   "(GPU-friendly), 'legacy' = assembled HypreParMatrix + "
                   "BoomerAMG.");
    args.AddOption(&gpu_aware_mpi, "-gpumpi", "--gpu-aware-mpi",
@@ -1177,9 +1177,9 @@ int main(int argc, char *argv[])
    }
    if (myid == 0) { args.PrintOptions(std::cout); }
 
-   bool matrix_free = true;
-   if (assembly_level == "legacy")       { matrix_free = false; }
-   else if (assembly_level == "partial") { matrix_free = true; }
+   bool partial_assembly = true;
+   if (assembly_level == "legacy")       { partial_assembly = false; }
+   else if (assembly_level == "partial") { partial_assembly = true; }
    else
    {
       if (myid == 0)
@@ -1222,7 +1222,7 @@ int main(int argc, char *argv[])
    }
 
    Ricci2DNonlinear ricci(MPI_COMM_WORLD, order, ref_levels, xL, yL,
-                          num_active, matrix_free, phi_lor, save_dir);
+                          num_active, partial_assembly, phi_lor, save_dir);
    ricci.Setup(restart ? cdir : "");
 
    ricci.syncGridFuncsFromBlocks(*ricci.StateBlocks());
@@ -1273,15 +1273,27 @@ int main(int argc, char *argv[])
 
       ricci.syncGridFuncsFromBlocks(*ricci.StateBlocks());
 
+      // Parallel global L2 norms of the true-dof state and of phi.  These
+      // must be computed on every rank (Allreduce inside InnerProduct) and
+      // only printed on rank 0.
+      auto gnorm = [&](const Vector &v)
+      { return std::sqrt(InnerProduct(MPI_COMM_WORLD, v, v)); };
+      const real_t T_norm = gnorm(ricci.StateBlocks()->GetBlock(T_IDX));
+      const real_t w_norm = gnorm(ricci.StateBlocks()->GetBlock(OMEGA_IDX));
+      const real_t n_norm = gnorm(ricci.StateBlocks()->GetBlock(N_IDX));
+      Vector phi_tdof(ricci.H1FES()->GetTrueVSize());
+      ricci.Phi()->ParallelProject(phi_tdof);
+      const real_t phi_norm = gnorm(phi_tdof);
+
       if (myid == 0)
       {
          std::cout << "step " << step
                    << "  t = " << t
                    << "  dt = " << dt_step
-                   << "  ||T||_2 = " << ricci.StateBlocks()->GetBlock(T_IDX).Norml2()
-                   << "  ||w||_2 = " << ricci.StateBlocks()->GetBlock(OMEGA_IDX).Norml2()
-                   << "  ||n||_2 = " << ricci.StateBlocks()->GetBlock(N_IDX).Norml2()
-                   << "  ||phi||_2 = " << ricci.Phi()->Norml2()
+                   << "  ||T||_2 = " << T_norm
+                   << "  ||w||_2 = " << w_norm
+                   << "  ||n||_2 = " << n_norm
+                   << "  ||phi||_2 = " << phi_norm
                    << std::endl;
       }
 

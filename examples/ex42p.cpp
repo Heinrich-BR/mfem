@@ -990,15 +990,27 @@ int main(int argc, char *argv[])
       // Mirror the new state into the per-variable ParGridFunctions for I/O.
       ricci.syncGridFuncsFromBlocks(*ricci.StateBlocks());
 
+      // Parallel global L2 norms of the true-dof state and of phi.  These
+      // must be computed on every rank (Allreduce inside InnerProduct) and
+      // only printed on rank 0.
+      auto gnorm = [&](const Vector &v)
+      { return std::sqrt(InnerProduct(MPI_COMM_WORLD, v, v)); };
+      const real_t T_norm = gnorm(ricci.StateBlocks()->GetBlock(T_IDX));
+      const real_t w_norm = gnorm(ricci.StateBlocks()->GetBlock(OMEGA_IDX));
+      const real_t n_norm = gnorm(ricci.StateBlocks()->GetBlock(N_IDX));
+      Vector phi_tdof(ricci.H1FES()->GetTrueVSize());
+      ricci.Phi()->ParallelProject(phi_tdof);
+      const real_t phi_norm = gnorm(phi_tdof);
+
       if (myid == 0)
       {
          std::cout << "step " << step
                    << "  t = " << t
                    << "  dt = " << dt_step
-                   << "  ||T||_2 = " << ricci.StateBlocks()->GetBlock(T_IDX).Norml2()
-                   << "  ||w||_2 = " << ricci.StateBlocks()->GetBlock(OMEGA_IDX).Norml2()
-                   << "  ||n||_2 = " << ricci.StateBlocks()->GetBlock(N_IDX).Norml2()
-                   << "  ||phi||_2 = " << ricci.Phi()->Norml2()
+                   << "  ||T||_2 = " << T_norm
+                   << "  ||w||_2 = " << w_norm
+                   << "  ||n||_2 = " << n_norm
+                   << "  ||phi||_2 = " << phi_norm
                    << std::endl;
       }
 

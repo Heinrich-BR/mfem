@@ -91,7 +91,7 @@ public:
                     int order, int ref_levels,
                     real_t xL, real_t yL,
                     int num_active,
-                    bool matrix_free, bool phi_lor,
+                    bool partial_assembly, bool phi_lor,
                     const std::string &save_dir);
    
    void Setup(const std::string &restart_dir);
@@ -116,19 +116,21 @@ public:
    RogersRicciReactionOp *ReactionOp() const { return _reaction_op.get(); }
 
    // Block operators M and K, exposed uniformly as Operator* so the hot paths
-   // (Mult/GetGradient) don't branch on the assembly mode.  In matrix-free mode
-   // these are PA operators; in legacy mode they are the assembled HypreParMatrix.
+   // (Mult/GetGradient) don't branch on the assembly mode.  In partial assembly
+   // mode these are PA operators; in legacy mode they are the assembled
+   // HypreParMatrix.
    Operator              *MassOp() const
-   { return _matrix_free ? _M_op.Ptr() : (Operator*)_M_mat.get(); }
+   { return _partial_assembly ? _M_op.Ptr() : (Operator*)_M_mat.get(); }
    Operator              *KOp() const
-   { return _matrix_free ? _K_op.Ptr() : (Operator*)_K_mat.get(); }
+   { return _partial_assembly ? _K_op.Ptr() : (Operator*)_K_mat.get(); }
    // HypreParMatrix views (legacy path only: Hypre Add + BoomerAMG).
    HypreParMatrix        *MassMatHypre() const { return _M_mat.get(); }
    HypreParMatrix        *KMatHypre() const { return _K_mat.get(); }
-   // True-dof diagonals of M and K (matrix-free path: Jacobi preconditioner).
+   // True-dof diagonals of M and K (partial assembly path: Jacobi
+   // preconditioner).
    const Vector          &MassDiag() const { return _M_diag; }
    const Vector          &KDiag() const { return _K_diag; }
-   bool                   MatrixFree() const { return _matrix_free; }
+   bool                   PartialAssembly() const { return _partial_assembly; }
 
    ParGridFunction       *Phi() const { return _phi.get(); }
    BlockVector           *StateBlocks() const { return _var_blocks.get(); }
@@ -143,7 +145,7 @@ public:
    real_t _S_0n   = 0.03;
    real_t _h      = 0.0; // element size
    int    _num_active = NUM_VARS;
-   bool   _matrix_free = true; // PA matrix-free (true) vs assembled+AMG (false)
+   bool   _partial_assembly = true; // partial assembly (true) vs assembled+AMG (false)
    bool   _phi_lor     = false; // phi solve: PA + LOR-AMG (true) vs assembled AMG
 
 private:
@@ -183,7 +185,7 @@ private:
    std::unique_ptr<HypreParMatrix> _M_mat;   // legacy path
    std::unique_ptr<ParBilinearForm> _K_form;
    std::unique_ptr<HypreParMatrix> _K_mat;   // legacy path
-   // Matrix-free path: true-dof-acting PA operators + their diagonals.
+   // Partial assembly path: true-dof-acting PA operators + their diagonals.
    OperatorHandle _M_op, _K_op;
    Vector         _M_diag, _K_diag;
    // Diffusion-only companion of K, used solely for the Jacobi diagonal:
@@ -262,9 +264,10 @@ private:
    mutable Vector                   _tmp_block;
 
    mutable BlockOperator                   _Jac_block;
-   // M + γK, built per stage.  Matrix-free path: a SumOperator wrapping the PA
-   // M and K operators.  Legacy path: an assembled HypreParMatrix via Hypre Add.
-   mutable std::unique_ptr<SumOperator>    _M_plus_gK_mf;
+   // M + γK, built per stage.  Partial assembly path: a SumOperator wrapping
+   // the PA M and K operators.  Legacy path: an assembled HypreParMatrix via
+   // Hypre Add.
+   mutable std::unique_ptr<SumOperator>    _M_plus_gK_pa;
    mutable std::unique_ptr<HypreParMatrix> _M_plus_gK_hypre;
 
    // Per-Newton-iter composition wrappers (cheap, no SpMV):
@@ -281,7 +284,7 @@ public:
    // setup every Newton iter.
    Operator *MassPlusGammaK() const
    {
-      return _M_plus_gK_mf ? (Operator*)_M_plus_gK_mf.get()
+      return _M_plus_gK_pa ? (Operator*)_M_plus_gK_pa.get()
                            : (Operator*)_M_plus_gK_hypre.get();
    }
    HypreParMatrix *MassPlusGammaKHypre() const { return _M_plus_gK_hypre.get(); }
